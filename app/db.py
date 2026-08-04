@@ -13,6 +13,8 @@ from app.paths import (
 )
 
 IS_MYSQL = DB_CONNECTION == "mysql"
+IS_POSTGRES = DB_CONNECTION == "postgres"
+IS_SERVER_DB = IS_MYSQL or IS_POSTGRES
 
 
 class _NoLock:
@@ -26,10 +28,10 @@ class _NoLock:
         return False
 
 
-# SQLite — единственный писатель, нужен глобальный лок; MySQL — параллелизм на сервере.
-_lock = threading.Lock() if not IS_MYSQL else _NoLock()
-# COLLATE для регистронезависимой сортировки: в MySQL коллация utf8mb4 и так CI.
-_CI = "" if IS_MYSQL else "COLLATE NOCASE"
+# SQLite — единственный писатель, нужен глобальный лок; серверные БД — параллелизм на сервере.
+_lock = threading.Lock() if not IS_SERVER_DB else _NoLock()
+# COLLATE для регистронезависимой сортировки: в MySQL/PostgreSQL коллация CI или отдельная логика.
+_CI = "" if IS_SERVER_DB else "COLLATE NOCASE"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
@@ -117,7 +119,55 @@ MYSQL_SCHEMA = [
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
     """,
 ]
-# utf8mb4_bin: побайтовое сравнение — пути и теги сопоставляются точно (иначе
+# PostgreSQL: полная схема (аналог MySQL, отдельные индексы).
+POSTGRES_SCHEMA = [
+    """
+    CREATE TABLE IF NOT EXISTS assets (
+        path VARCHAR(600) NOT NULL PRIMARY KEY,
+        name TEXT NOT NULL,
+        ext VARCHAR(32) NOT NULL,
+        size BIGINT NOT NULL,
+        mtime DOUBLE PRECISION NOT NULL,
+        preview_file TEXT,
+        preview_source VARCHAR(32),
+        preview_status VARCHAR(16) NOT NULL DEFAULT 'none',
+        preview_error TEXT,
+        blend_path TEXT,
+        content_adult SMALLINT,
+        content_nudity SMALLINT,
+        content_violence SMALLINT,
+        content_horror SMALLINT,
+        content_gore SMALLINT,
+        content_sensitive_tags TEXT,
+        safety_checked_at DOUBLE PRECISION,
+        description TEXT,
+        description_source VARCHAR(32),
+        described_at DOUBLE PRECISION,
+        embedded_at DOUBLE PRECISION,
+        first_seen DOUBLE PRECISION NOT NULL,
+        updated_at DOUBLE PRECISION NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_assets_preview_status ON assets(preview_status)",
+    """
+    CREATE TABLE IF NOT EXISTS meta (
+        "key" VARCHAR(190) NOT NULL PRIMARY KEY,
+        "value" TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS asset_tags (
+        path VARCHAR(600) NOT NULL,
+        tag VARCHAR(150) NOT NULL,
+        source VARCHAR(32) NOT NULL DEFAULT 'manual',
+        created_at DOUBLE PRECISION NOT NULL,
+        PRIMARY KEY (path, tag)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_asset_tags_tag ON asset_tags(tag)",
+    "CREATE INDEX IF NOT EXISTS idx_asset_tags_path ON asset_tags(path)",
+]
+# utf8mb4_bin / PostgreSQL text: побайтовое сравнение — пути и теги сопоставляются точно (иначе
 # 'Model' == 'model' и NFC/NFD-варианты акцентов схлопываются в один PK).
 
 
@@ -150,43 +200,34 @@ class _Row:
         return len(self._v)
 
 
-class _MySQLCursor:
-    def __init__(self, cur):
-        self._cur = cur
-        self._cols = [d[0] for d in cur.description] if cur.description else []
-
-    def fetchone(self):
-        row = self._cur.fetchone()
-        return _Row(row, self._cols) if row is not None else None
-
-    def fetchall(self):
-        return [_Row(r, self._cols) for r in self._cur.fetchall()]
-
-    def __iter__(self):
-        return iter(self.fetchall())
-
-
-class _MySQLConn:
-    """Обёртка над pymysql с интерфейсом как у sqlite3.Connection (execute/commit/close)
+class _ServerConn:
+    """Обёртка над pymysql/psycopg2 с интерфейсом как у sqlite3.Connection (execute/commit/close)
     и трансляцией плейсхолдеров ? → %s."""
 
-    def __init__(self, raw):
+    def __init__(self, raw, *, postgres: bool = False):
         self._raw = raw
+        self._postgres = postgres
+
+    def _adapt_sql(self, sql: str) -> str:
+        sql = sql.replace("?", "%s")
+        if self._postgres:
+            sql = sql.replace("`", '"')
+        return sql
 
     def execute(self, sql, params=()):
         cur = self._raw.cursor()
-        cur.execute(sql.replace("?", "%s"), params or None)
-        return _MySQLCursor(cur)
+        cur.execute(self._adapt_sql(sql), params or None)
+        return _ServerCursor(cur)
 
     def executemany(self, sql, seq):
         seq = list(seq)
         if not seq:
             return None
         cur = self._raw.cursor()
-        cur.executemany(sql.replace("?", "%s"), seq)
-        return _MySQLCursor(cur)
+        cur.executemany(self._adapt_sql(sql), seq)
+        return _ServerCursor(cur)
 
-    def executescript(self, sql):  # совместимость (в MySQL не используется)
+    def executescript(self, sql):
         for stmt in filter(str.strip, sql.split(";")):
             self._raw.cursor().execute(stmt)
 
@@ -206,7 +247,28 @@ class _MySQLConn:
             self._raw.rollback()
 
 
-def _connect():
+class _ServerCursor:
+    def __init__(self, cur):
+        self._cur = cur
+        self._cols = [d[0] for d in cur.description] if cur.description else []
+
+    def fetchone(self):
+        row = self._cur.fetchone()
+        return _Row(row, self._cols) if row is not None else None
+
+    def fetchall(self):
+        return [_Row(r, self._cols) for r in self._cur.fetchall()]
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+# Совместимость имён (если где-то ссылались).
+_MySQLConn = _ServerConn
+_MySQLCursor = _ServerCursor
+
+
+def _connect_server():
     if IS_MYSQL:
         import pymysql
 
@@ -220,7 +282,24 @@ def _connect():
             autocommit=False,
             connect_timeout=10,
         )
-        return _MySQLConn(raw)
+        return _ServerConn(raw, postgres=False)
+    import psycopg2
+
+    raw = psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USERNAME,
+        password=DB_PASSWORD,
+        dbname=DB_DATABASE,
+        connect_timeout=10,
+    )
+    raw.autocommit = False
+    return _ServerConn(raw, postgres=True)
+
+
+def _connect():
+    if IS_SERVER_DB:
+        return _connect_server()
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(SQLITE_PATH), check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
@@ -233,8 +312,8 @@ def _connect():
 
 
 def _ensure_asset_columns(conn) -> None:
-    if IS_MYSQL:
-        return  # MYSQL_SCHEMA уже содержит все колонки
+    if IS_SERVER_DB:
+        return  # серверная схема уже содержит все колонки
     cur = conn.execute("PRAGMA table_info(assets)")
     cols = {row[1] for row in cur.fetchall()}
     wanted = {
@@ -263,6 +342,9 @@ def init_db() -> None:
         try:
             if IS_MYSQL:
                 for stmt in MYSQL_SCHEMA:
+                    conn.execute(stmt)
+            elif IS_POSTGRES:
+                for stmt in POSTGRES_SCHEMA:
                     conn.execute(stmt)
             else:
                 conn.executescript(SCHEMA)
@@ -523,6 +605,14 @@ def set_last_scan_time(conn, ts: float) -> None:
             "ON DUPLICATE KEY UPDATE `value` = new.`value`",
             (str(ts),),
         )
+    elif IS_POSTGRES:
+        conn.execute(
+            """
+            INSERT INTO meta ("key", "value") VALUES ('last_full_scan_at', ?)
+            ON CONFLICT ("key") DO UPDATE SET "value" = EXCLUDED."value"
+            """,
+            (str(ts),),
+        )
     else:
         conn.execute(
             """
@@ -556,6 +646,15 @@ def add_tags(
                     "INSERT IGNORE INTO asset_tags (path, tag, source, created_at) VALUES (?, ?, ?, ?)",
                     (path, t, source, now),
                 )
+            elif IS_POSTGRES:
+                conn.execute(
+                    """
+                    INSERT INTO asset_tags (path, tag, source, created_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT (path, tag) DO NOTHING
+                    """,
+                    (path, t, source, now),
+                )
             else:
                 conn.execute(
                     """
@@ -570,6 +669,17 @@ def add_tags(
                 conn.execute(
                     "INSERT INTO asset_tags (path, tag, source, created_at) VALUES (?, ?, ?, ?) AS new "
                     "ON DUPLICATE KEY UPDATE source = new.source, created_at = new.created_at",
+                    (path, t, source, now),
+                )
+            elif IS_POSTGRES:
+                conn.execute(
+                    """
+                    INSERT INTO asset_tags (path, tag, source, created_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT (path, tag) DO UPDATE SET
+                        source = EXCLUDED.source,
+                        created_at = EXCLUDED.created_at
+                    """,
                     (path, t, source, now),
                 )
             else:

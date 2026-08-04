@@ -1,0 +1,139 @@
+# Деплой-вариант compose для Coolify (сервер 2 vCPU / 4 ГБ RAM).
+#
+# Отличия от локального docker-compose.yml:
+#   * наружу не публикуется ни один порт — HTTP идёт через coolify-proxy (Traefik)
+#     по домену из SERVICE_FQDN_APP_8000, Postgres и Qdrant доступны только внутри сети;
+#   * лимиты CPU/RAM ужаты под реальный размер сервера;
+#   * каталог моделей берётся из S3 (STORAGE_BACKEND=s3), локальный том не монтируется.
+#
+# Секреты (OPENAI_API_KEY, S3_*, DB_PASSWORD) задаются в Coolify → Environment Variables.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    mem_limit: 320m
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-model_catalog}
+      POSTGRES_USER: ${DB_USERNAME:-model_catalog}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    mem_limit: 448m
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    restart: unless-stopped
+    mem_limit: 1200m
+    mem_reservation: 512m
+    cpus: "1.5"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    environment:
+      - SERVICE_FQDN_APP_8000
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - DB_CONNECTION=postgres
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_DATABASE=${DB_DATABASE:-model_catalog}
+      - DB_USERNAME=${DB_USERNAME:-model_catalog}
+      - DB_PASSWORD=${DB_PASSWORD:?DB_PASSWORD is required}
+      - DATA_DIR=/data/app
+      - API_BASE_URL=${SERVICE_FQDN_APP_8000}
+      - RUN_SCANNER=${RUN_SCANNER:-1}
+      - SCAN_INTERVAL_SEC=${SCAN_INTERVAL_SEC:-300}
+      # Рендер превью на 2 ядрах — держим аппетит в рамках лимита контейнера.
+      - PREVIEW_MAX_MEMORY_MB=${PREVIEW_MAX_MEMORY_MB:-768}
+      - PREVIEW_BATCH_PER_CYCLE=${PREVIEW_BATCH_PER_CYCLE:-50}
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-s3}
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL}
+      - S3_REGION=${S3_REGION}
+      - S3_BUCKET=${S3_BUCKET}
+      - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID}
+      - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY}
+      - S3_PREFIX=${S3_PREFIX:-}
+      - S3_ADDRESSING_STYLE=${S3_ADDRESSING_STYLE:-path}
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-models}
+      - EMBED_DIM=${EMBED_DIM:-1536}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_TAG_MODEL=${OPENAI_TAG_MODEL:-gpt-4o-mini}
+      - OPENAI_DESCRIBE_MODEL=${OPENAI_DESCRIBE_MODEL:-gpt-4o-mini}
+      - OPENAI_EMBED_MODEL=${OPENAI_EMBED_MODEL:-text-embedding-3-small}
+    volumes:
+      - app_data:/data/app
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+
+  # Воркер обогащения БД: авто-теги (Vision) + AI-описания + эмбеддинги в Qdrant.
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    mem_limit: 768m
+    mem_reservation: 256m
+    cpus: "1.0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - DB_CONNECTION=postgres
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_DATABASE=${DB_DATABASE:-model_catalog}
+      - DB_USERNAME=${DB_USERNAME:-model_catalog}
+      - DB_PASSWORD=${DB_PASSWORD:?DB_PASSWORD is required}
+      - DATA_DIR=/data/app
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-s3}
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL}
+      - S3_REGION=${S3_REGION}
+      - S3_BUCKET=${S3_BUCKET}
+      - S3_ACCESS_KEY_ID=${S3_ACCESS_KEY_ID}
+      - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY}
+      - S3_PREFIX=${S3_PREFIX:-}
+      - S3_ADDRESSING_STYLE=${S3_ADDRESSING_STYLE:-path}
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-models}
+      - EMBED_DIM=${EMBED_DIM:-1536}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_TAG_MODEL=${OPENAI_TAG_MODEL:-gpt-4o-mini}
+      - OPENAI_DESCRIBE_MODEL=${OPENAI_DESCRIBE_MODEL:-gpt-4o-mini}
+      - OPENAI_EMBED_MODEL=${OPENAI_EMBED_MODEL:-text-embedding-3-small}
+      - WORKER_INTERVAL_SEC=${WORKER_INTERVAL_SEC:-30}
+      - WORKER_TAG_BATCH=${WORKER_TAG_BATCH:-20}
+      - WORKER_DESCRIBE_BATCH=${WORKER_DESCRIBE_BATCH:-20}
+      - WORKER_DO_TAGS=${WORKER_DO_TAGS:-1}
+      - WORKER_DO_DESCRIBE=${WORKER_DO_DESCRIBE:-1}
+    volumes:
+      - app_data:/data/app
+
+volumes:
+  postgres_data:
+  qdrant_storage:
+  app_data:

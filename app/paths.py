@@ -39,10 +39,11 @@ SQLITE_PATH = Path(
     os.environ.get("SQLITE_PATH", DATA_DIR / "catalog.sqlite")
 ).resolve()
 
-# --- База данных каталога: sqlite (по умолчанию) или mysql ---
+# --- База данных каталога: sqlite (по умолчанию), postgres или mysql ---
 DB_CONNECTION = os.environ.get("DB_CONNECTION", "sqlite").strip().lower()
 DB_HOST = os.environ.get("DB_HOST", "127.0.0.1").strip()
-DB_PORT = int(os.environ.get("DB_PORT", "3306"))
+_default_db_port = {"postgres": 5432, "mysql": 3306}.get(DB_CONNECTION, 3306)
+DB_PORT = int(os.environ.get("DB_PORT", str(_default_db_port)))
 DB_DATABASE = os.environ.get("DB_DATABASE", "model_catalog").strip()
 DB_USERNAME = os.environ.get("DB_USERNAME", "").strip()
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
