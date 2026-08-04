@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Галерея 3D моделей</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script
+      type="module"
+      src="https://ajax.googleapis.com/ajax/libs/model-viewer/3.5.0/model-viewer.min.js"
+    ></script>
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>Галерея моделей</h1>
+        <p class="meta" id="root-path"></p>
+      </div>
+      <div class="toolbar toolbar-stack">
+        <div class="toolbar-row">
+          <input type="search" id="filter" placeholder="Фильтр по имени, пути или тегу…" autocomplete="off" />
+          <button type="button" class="ghost" id="reload">Обновить</button>
+        </div>
+        <div class="toolbar-row tag-toolbar">
+          <label class="tag-mode">
+            <input type="checkbox" id="filter-tags-all" />
+            <span>Все теги сразу</span>
+          </label>
+          <input
+            type="text"
+            id="filter-tags"
+            class="tag-input"
+            placeholder="Теги через запятую: character, vehicle…"
+            autocomplete="off"
+          />
+          <button type="button" class="ghost" id="tag-ai" title="Нужен OPENAI_API_KEY на сервере">
+            Теги ИИ
+          </button>
+        </div>
+      </div>
+    </header>
+    <main>
+      <div id="status" class="status">Загрузка…</div>
+      <div id="grid" class="grid" hidden></div>
+    </main>
+
+    <div id="overlay" class="overlay" role="dialog" aria-modal="true" aria-label="Просмотр модели">
+      <div class="modal">
+        <div class="modal-head">
+          <h2 id="modal-title"></h2>
+          <div class="modal-actions">
+            <a id="download-link" href="#" download>
+              <button type="button">Скачать</button>
+            </a>
+            <button type="button" class="ghost" id="close-modal">Закрыть</button>
+          </div>
+        </div>
+        <div class="viewer-wrap">
+          <div class="viewer-layout">
+            <div class="viewer-main">
+              <model-viewer
+                id="mv"
+                camera-controls
+                shadow-intensity="1"
+                exposure="1"
+                environment-image="neutral"
+                style="display: none"
+              ></model-viewer>
+              <div id="three-container" style="display: none"></div>
+              <div id="viewer-fallback" class="viewer-fallback hidden"></div>
+            </div>
+            <aside id="unit-panel" class="unit-panel" hidden>
+              <div class="unit-panel-head">
+                <h3 class="unit-panel-title">Main unit</h3>
+                <button type="button" class="ghost unit-copy-btn" id="unit-copy-json">
+                  JSON
+                </button>
+              </div>
+              <p class="unit-hint">
+                Позиция, масштаб, поворот (°) и соответствие клипов действиям.
+              </p>
+              <h4 class="unit-sub">Трансформ</h4>
+              <div class="unit-transform" id="unit-transform"></div>
+              <h4 class="unit-sub">Предпросмотр клипа</h4>
+              <select id="unit-clip-preview" class="unit-select-wide" aria-label="Клип"></select>
+              <h4 class="unit-sub">Действия</h4>
+              <div class="unit-action-map" id="unit-action-map"></div>
+            </aside>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
+        }
+      }
+    </script>
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>

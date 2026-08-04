@@ -1,0 +1,115 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    ports:
+      # host:container — наружу нестандартные порты, чтобы не конфликтовать
+      # с другими Qdrant/сервисами на машине. Внутри compose используется 6333.
+      - "${QDRANT_HOST_PORT:-16333}:6333"   # REST + дашборд на /dashboard
+      - "${QDRANT_GRPC_HOST_PORT:-16334}:6334"   # gRPC
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+# ────────────────────────────────────────────────────────────────────────────
+# ВРЕМЕННО ОТКЛЮЧЕНО. Сейчас app и worker запускаются локально из .venv, а БД —
+# внешний MySQL (см. DB_* в .env). В Docker поднимаем только Qdrant.
+# Чтобы вернуть контейнеры — раскомментируйте блок ниже.
+#
+# Лимиты worker: не более 20% RAM (~7 ГБ из 36) и 25% CPU (3.5 ядра из 14).
+# ────────────────────────────────────────────────────────────────────────────
+#
+#   app:
+#     build: .
+#     restart: unless-stopped
+#     mem_limit: 7g
+#     mem_reservation: 1g
+#     cpus: "6.0"
+#     depends_on:
+#       qdrant:
+#         condition: service_healthy
+#     ports:
+#       - "${APP_HOST_PORT:-18080}:8000"
+#     environment:
+#       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+#       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+#       OPENAI_DESCRIBE_MODEL: ${OPENAI_DESCRIBE_MODEL:-gpt-4o-mini}
+#       OPENAI_EMBED_MODEL: ${OPENAI_EMBED_MODEL:-text-embedding-3-small}
+#       EMBED_DIM: ${EMBED_DIM:-1536}
+#       QDRANT_HOST: qdrant
+#       QDRANT_PORT: 6333
+#       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-models}
+#       API_BASE_URL: ${API_BASE_URL:-http://127.0.0.1:18080}
+#       # База каталога: внешний MySQL.
+#       DB_CONNECTION: ${DB_CONNECTION:-sqlite}
+#       DB_HOST: ${DB_HOST:-127.0.0.1}
+#       DB_PORT: ${DB_PORT:-3306}
+#       DB_DATABASE: ${DB_DATABASE:-model_catalog}
+#       DB_USERNAME: ${DB_USERNAME:-}
+#       DB_PASSWORD: ${DB_PASSWORD:-}
+#       STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+#       S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+#       S3_REGION: ${S3_REGION:-}
+#       S3_BUCKET: ${S3_BUCKET:-}
+#       S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+#       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+#       S3_PREFIX: ${S3_PREFIX:-}
+#       S3_ADDRESSING_STYLE: ${S3_ADDRESSING_STYLE:-path}
+#       PREVIEW_MAX_MEMORY_MB: ${PREVIEW_MAX_MEMORY_MB:-6144}
+#       RUN_SCANNER: ${RUN_SCANNER:-1}
+#     volumes:
+#       - "${MODELS_HOST_DIR:-./models}:/data/models:ro"
+#       - app_data:/data/app
+#
+#   # Воркер обогащения БД: авто-теги (Vision) + AI-описания + эмбеддинги в Qdrant.
+#   worker:
+#     build: .
+#     restart: unless-stopped
+#     command: ["python", "-m", "app.worker"]
+#     # Лимиты: не более 20% RAM и 25% CPU хоста.
+#     mem_limit: 7g            # ~20% от 36 ГБ
+#     mem_reservation: 512m
+#     cpus: "3.5"              # 25% от 14 ядер
+#     depends_on:
+#       qdrant:
+#         condition: service_healthy
+#     environment:
+#       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+#       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+#       OPENAI_TAG_MODEL: ${OPENAI_TAG_MODEL:-gpt-4o-mini}
+#       OPENAI_DESCRIBE_MODEL: ${OPENAI_DESCRIBE_MODEL:-gpt-4o-mini}
+#       OPENAI_EMBED_MODEL: ${OPENAI_EMBED_MODEL:-text-embedding-3-small}
+#       EMBED_DIM: ${EMBED_DIM:-1536}
+#       QDRANT_HOST: qdrant
+#       QDRANT_PORT: 6333
+#       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-models}
+#       DB_CONNECTION: ${DB_CONNECTION:-sqlite}
+#       DB_HOST: ${DB_HOST:-127.0.0.1}
+#       DB_PORT: ${DB_PORT:-3306}
+#       DB_DATABASE: ${DB_DATABASE:-model_catalog}
+#       DB_USERNAME: ${DB_USERNAME:-}
+#       DB_PASSWORD: ${DB_PASSWORD:-}
+#       STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+#       S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+#       S3_REGION: ${S3_REGION:-}
+#       S3_BUCKET: ${S3_BUCKET:-}
+#       S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+#       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+#       S3_PREFIX: ${S3_PREFIX:-}
+#       S3_ADDRESSING_STYLE: ${S3_ADDRESSING_STYLE:-path}
+#       WORKER_INTERVAL_SEC: ${WORKER_INTERVAL_SEC:-30}
+#       WORKER_TAG_BATCH: ${WORKER_TAG_BATCH:-20}
+#       WORKER_DESCRIBE_BATCH: ${WORKER_DESCRIBE_BATCH:-20}
+#       WORKER_DO_TAGS: ${WORKER_DO_TAGS:-1}
+#       WORKER_DO_DESCRIBE: ${WORKER_DO_DESCRIBE:-1}
+#     volumes:
+#       - "${MODELS_HOST_DIR:-./models}:/data/models:ro"
+#       - app_data:/data/app
+
+volumes:
+  qdrant_storage:
+  app_data:

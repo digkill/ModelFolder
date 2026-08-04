@@ -1,0 +1,15 @@
+.git
+.gitignore
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.DS_Store
+.env
+data/
+models/
+scratchpad/
+*.md
+.claude/
+.vscode/
