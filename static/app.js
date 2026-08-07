@@ -238,64 +238,132 @@ function contentBadges(content) {
   return out;
 }
 
-function buildModelsQuery() {
-  const p = new URLSearchParams();
+// Каталог вырос до тысяч моделей, поэтому грузим его страницами по мере
+// прокрутки: отдавать всё одним запросом — это мегабайты JSON и сотни картинок
+// в первом же ответе. Фильтры при этом считает БД, а не браузер.
+const PAGE_SIZE = 60;
+let offset = 0;
+let totalCount = 0;
+let loadingPage = false;
+let exhausted = false;
+// Номер запроса: пока летит ответ, пользователь мог сменить фильтр — тогда
+// пришедшую страницу надо выбросить, иначе она подмешается к чужой выдаче.
+let requestSeq = 0;
+
+function buildSearchBody() {
+  const body = { limit: PAGE_SIZE, offset, sort: "name" };
   const raw = document.getElementById("filter-tags").value.trim();
   if (raw) {
-    if (document.getElementById("filter-tags-all").checked) {
-      p.set("tags_all", raw);
-    } else {
-      p.set("tags", raw);
-    }
+    const tags = raw.split(",").map((s) => s.trim()).filter(Boolean);
+    if (document.getElementById("filter-tags-all").checked) body.tags_all = tags;
+    else body.tags = tags;
   }
-  const s = p.toString();
-  return s ? `?${s}` : "";
+  const q = document.getElementById("filter").value.trim();
+  if (q) body.name_contains = q;
+  return body;
+}
+
+async function fetchPage(seq) {
+  const res = await fetch("/api/catalog/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(buildSearchBody()),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  if (seq !== requestSeq) return null; // фильтр успел смениться — ответ устарел
+  return data;
 }
 
 async function loadModels() {
-  setStatus("Загрузка…");
+  const seq = ++requestSeq;
+  offset = 0;
+  exhausted = false;
+  items = [];
+  document.getElementById("grid").innerHTML = "";
   document.getElementById("grid").hidden = true;
+  setStatus("Загрузка…");
+  loadingPage = true;
   try {
-    const q = buildModelsQuery();
-    const [modelsRes, statusRes] = await Promise.all([
-      fetch(`/api/models${q}`),
-      fetch("/api/status"),
-    ]);
-    if (!modelsRes.ok) throw new Error(`HTTP ${modelsRes.status}`);
-    const data = await modelsRes.json();
-    items = data.items || [];
-    let rootLine = data.root || "";
+    const [data, statusRes] = await Promise.all([fetchPage(seq), fetch("/api/status")]);
+    if (data === null) return;
+    totalCount = data.total || 0;
+    let rootLine = totalCount ? `Моделей в каталоге: ${totalCount}` : "";
     if (statusRes.ok) {
       const st = await statusRes.json();
       const extra = formatScanMeta(st.last_full_scan_at, st.pending_previews);
       if (extra) rootLine = `${rootLine}\n${extra}`;
     }
     document.getElementById("root-path").textContent = rootLine;
-    renderGrid();
-    hideStatus();
-    document.getElementById("grid").hidden = items.length === 0;
-    if (items.length === 0) {
-      setStatus("В папке моделей нет файлов с расширениями .fbx .glb .gltf .usdz .flb");
+
+    const page = data.items || [];
+    items = page;
+    offset = page.length;
+    exhausted = page.length < PAGE_SIZE || offset >= totalCount;
+    appendItems(page);
+    if (page.length === 0) {
+      setStatus(totalCount === 0 ? "Каталог пуст" : "Ничего не найдено по фильтру");
+      document.getElementById("grid").hidden = true;
+    } else {
+      hideStatus();
+      document.getElementById("grid").hidden = false;
     }
   } catch (e) {
     setStatus(String(e.message || e), true);
+  } finally {
+    loadingPage = false;
+    updateSentinel();
   }
 }
 
-function renderGrid() {
-  const grid = document.getElementById("grid");
-  const q = document.getElementById("filter").value.trim().toLowerCase();
-  grid.innerHTML = "";
-  const filtered = q
-    ? items.filter((it) => {
-        const hay = `${it.name} ${it.path}`.toLowerCase();
-        if (hay.includes(q)) return true;
-        const tl = it.tag_list || [];
-        return tl.some((t) => String(t).toLowerCase().includes(q));
-      })
-    : items;
+async function loadMore() {
+  if (loadingPage || exhausted) return;
+  const seq = requestSeq;
+  loadingPage = true;
+  try {
+    const data = await fetchPage(seq);
+    if (data === null) return;
+    const page = data.items || [];
+    totalCount = data.total || totalCount;
+    items = items.concat(page);
+    offset += page.length;
+    exhausted = page.length < PAGE_SIZE || offset >= totalCount;
+    appendItems(page);
+  } catch (e) {
+    setStatus(String(e.message || e), true);
+    exhausted = true; // не долбим сервер в цикле после ошибки
+  } finally {
+    loadingPage = false;
+    updateSentinel();
+  }
+}
 
-  for (const it of filtered) {
+function updateSentinel() {
+  const el = document.getElementById("scroll-sentinel");
+  if (!el) return;
+  if (exhausted) {
+    el.textContent = items.length ? `Показаны все ${items.length} из ${totalCount}` : "";
+  } else {
+    el.textContent = `Загружено ${items.length} из ${totalCount}…`;
+  }
+  el.hidden = items.length === 0;
+}
+
+function initInfiniteScroll() {
+  const el = document.getElementById("scroll-sentinel");
+  if (!el || !("IntersectionObserver" in window)) return;
+  // rootMargin: начинаем подгрузку заранее, чтобы прокрутка не упиралась в конец.
+  new IntersectionObserver(
+    (entries) => {
+      if (entries.some((e) => e.isIntersecting)) loadMore();
+    },
+    { rootMargin: "600px 0px" }
+  ).observe(el);
+}
+
+function appendItems(list) {
+  const grid = document.getElementById("grid");
+  for (const it of list) {
     const icon = EXT_ICON[it.ext] || "📄";
     const card = document.createElement("article");
     card.className = "card";
@@ -404,14 +472,6 @@ function renderGrid() {
     card.style.cursor = "pointer";
     card.addEventListener("click", () => openViewer(it));
     grid.appendChild(card);
-  }
-
-  if (filtered.length === 0 && items.length > 0) {
-    setStatus("Ничего не найдено по фильтру");
-    grid.hidden = true;
-  } else if (filtered.length > 0) {
-    hideStatus();
-    grid.hidden = false;
   }
 }
 
@@ -674,7 +734,13 @@ document.getElementById("filter-tags").addEventListener("keydown", (e) => {
   if (e.key === "Enter") loadModels();
 });
 document.getElementById("filter-tags-all").addEventListener("change", () => loadModels());
-document.getElementById("filter").addEventListener("input", renderGrid);
+// Фильтр по имени ушёл на сервер (ищем по всему каталогу, а не по подгруженной
+// странице), поэтому вводу нужна задержка — иначе запрос на каждую букву.
+let filterTimer = null;
+document.getElementById("filter").addEventListener("input", () => {
+  clearTimeout(filterTimer);
+  filterTimer = setTimeout(loadModels, 300);
+});
 document.getElementById("close-modal").addEventListener("click", closeModal);
 document.getElementById("overlay").addEventListener("click", (e) => {
   if (e.target.id === "overlay") closeModal();
@@ -684,4 +750,5 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closeModal();
 });
 
+initInfiniteScroll();
 loadModels();

@@ -281,6 +281,9 @@ def _connect_server():
             charset="utf8mb4",
             autocommit=False,
             connect_timeout=10,
+            # Симметрично PostgreSQL: не висеть вечно на оборвавшемся соединении.
+            read_timeout=120,
+            write_timeout=120,
         )
         return _ServerConn(raw, postgres=False)
     import psycopg2
@@ -292,6 +295,15 @@ def _connect_server():
         password=DB_PASSWORD,
         dbname=DB_DATABASE,
         connect_timeout=10,
+        # БД ходит через SSH-туннель, который периодически рвётся. Без keepalive
+        # сокет умирает молча, и процесс висит на нём десятками минут, пока
+        # туннель не поднимется. С этими параметрами обрыв виден примерно за минуту.
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=3,
+        # Страховка от запроса, зависшего уже на стороне сервера.
+        options="-c statement_timeout=120000",
     )
     raw.autocommit = False
     return _ServerConn(raw, postgres=True)
@@ -311,44 +323,151 @@ def _connect():
     return conn
 
 
+# Колонки, которые дообавляются к `assets` миграцией: имя -> (sqlite, mysql, postgres).
+# Держим их здесь, а не только в CREATE TABLE: боевые БД уже созданы, а
+# `CREATE TABLE IF NOT EXISTS` новые колонки не добавляет.
+_ASSET_COLUMNS: dict[str, tuple[str, str, str]] = {
+    "blend_path": ("TEXT", "TEXT", "TEXT"),
+    "preview_source": ("TEXT", "VARCHAR(32)", "VARCHAR(32)"),
+    "content_adult": ("INTEGER", "TINYINT", "SMALLINT"),
+    "content_nudity": ("INTEGER", "TINYINT", "SMALLINT"),
+    "content_violence": ("INTEGER", "TINYINT", "SMALLINT"),
+    "content_horror": ("INTEGER", "TINYINT", "SMALLINT"),
+    "content_gore": ("INTEGER", "TINYINT", "SMALLINT"),
+    "content_sensitive_tags": ("TEXT", "TEXT", "TEXT"),
+    "safety_checked_at": ("REAL", "DOUBLE", "DOUBLE PRECISION"),
+    "description": ("TEXT", "TEXT", "TEXT"),
+    "description_source": ("TEXT", "VARCHAR(32)", "VARCHAR(32)"),
+    "described_at": ("REAL", "DOUBLE", "DOUBLE PRECISION"),
+    "embedded_at": ("REAL", "DOUBLE", "DOUBLE PRECISION"),
+    # --- ingest: происхождение и дедупликация ---
+    # sha256 файла модели: единственный надёжный признак дубля, когда одна и та же
+    # модель лежит в разных папках/категориях под разными именами.
+    "content_hash": ("TEXT", "VARCHAR(64)", "VARCHAR(64)"),
+    "dir_key": ("TEXT", "TEXT", "TEXT"),
+    "local_dir": ("TEXT", "TEXT", "TEXT"),
+    "source_url": ("TEXT", "TEXT", "TEXT"),
+    "preview_key": ("TEXT", "TEXT", "TEXT"),
+    "ingested_at": ("REAL", "DOUBLE", "DOUBLE PRECISION"),
+    # --- классификация ---
+    "category": ("TEXT", "VARCHAR(32)", "VARCHAR(32)"),
+    "collection": ("TEXT", "TEXT", "TEXT"),
+    "age_rating": ("TEXT", "VARCHAR(16)", "VARCHAR(16)"),
+    "kid_friendly": ("INTEGER", "TINYINT", "SMALLINT"),
+    "nsfw": ("INTEGER", "TINYINT", "SMALLINT"),
+    "classified_at": ("REAL", "DOUBLE", "DOUBLE PRECISION"),
+    # --- метаданные геометрии ---
+    "vertex_count": ("INTEGER", "BIGINT", "BIGINT"),
+    "face_count": ("INTEGER", "BIGINT", "BIGINT"),
+    "mesh_count": ("INTEGER", "INT", "INTEGER"),
+    "material_count": ("INTEGER", "INT", "INTEGER"),
+    "texture_count": ("INTEGER", "INT", "INTEGER"),
+    "animation_count": ("INTEGER", "INT", "INTEGER"),
+    "has_rig": ("INTEGER", "TINYINT", "SMALLINT"),
+    "bbox_x": ("REAL", "DOUBLE", "DOUBLE PRECISION"),
+    "bbox_y": ("REAL", "DOUBLE", "DOUBLE PRECISION"),
+    "bbox_z": ("REAL", "DOUBLE", "DOUBLE PRECISION"),
+    "meta_json": ("TEXT", "TEXT", "TEXT"),
+}
+
+_EXTRA_INDEXES = (
+    ("idx_assets_content_hash", "assets(content_hash)"),
+    ("idx_assets_category", "assets(category)"),
+    ("idx_assets_age_rating", "assets(age_rating)"),
+    ("idx_assets_nsfw", "assets(nsfw)"),
+    ("idx_assets_kid_friendly", "assets(kid_friendly)"),
+    ("idx_assets_ext", "assets(ext)"),
+    ("idx_assets_animation_count", "assets(animation_count)"),
+)
+
+
+def _assets_table_exists(conn) -> bool:
+    if IS_MYSQL:
+        row = conn.execute(
+            "SELECT 1 FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'assets'"
+        ).fetchone()
+    elif IS_POSTGRES:
+        row = conn.execute("SELECT to_regclass('assets')").fetchone()
+        return bool(row and row[0])
+    else:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'assets'"
+        ).fetchone()
+    return bool(row)
+
+
+def _existing_asset_columns(conn) -> set[str]:
+    if IS_MYSQL:
+        cur = conn.execute(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'assets'"
+        )
+    elif IS_POSTGRES:
+        cur = conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'assets'"
+        )
+    else:
+        cur = conn.execute("PRAGMA table_info(assets)")
+        return {row[1] for row in cur.fetchall()}
+    return {str(r[0]) for r in cur.fetchall()}
+
+
 def _ensure_asset_columns(conn) -> None:
-    if IS_SERVER_DB:
-        return  # серверная схема уже содержит все колонки
-    cur = conn.execute("PRAGMA table_info(assets)")
-    cols = {row[1] for row in cur.fetchall()}
-    wanted = {
-        "blend_path": "TEXT",
-        "preview_source": "TEXT",
-        "content_adult": "INTEGER",
-        "content_nudity": "INTEGER",
-        "content_violence": "INTEGER",
-        "content_horror": "INTEGER",
-        "content_gore": "INTEGER",
-        "content_sensitive_tags": "TEXT",
-        "safety_checked_at": "REAL",
-        "description": "TEXT",
-        "description_source": "TEXT",
-        "described_at": "REAL",
-        "embedded_at": "REAL",
-    }
-    for name, typ in wanted.items():
+    cols = _existing_asset_columns(conn)
+    idx = 1 if IS_MYSQL else (2 if IS_POSTGRES else 0)
+    for name, types in _ASSET_COLUMNS.items():
         if name not in cols:
-            conn.execute(f"ALTER TABLE assets ADD COLUMN {name} {typ}")
+            conn.execute(f"ALTER TABLE assets ADD COLUMN {name} {types[idx]}")
+
+
+def _existing_index_names(conn) -> set[str]:
+    if IS_MYSQL:
+        cur = conn.execute(
+            "SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'assets'"
+        )
+    elif IS_POSTGRES:
+        cur = conn.execute(
+            "SELECT indexname FROM pg_indexes "
+            "WHERE schemaname = current_schema() AND tablename = 'assets'"
+        )
+    else:
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'assets'"
+        )
+    return {str(r[0]) for r in cur.fetchall()}
+
+
+def _ensure_extra_indexes(conn) -> None:
+    # Сверяемся со словарём БД до DDL: даже `CREATE INDEX IF NOT EXISTS` берёт
+    # блокировку таблицы и на живой заливке ловит deadlock со вставками.
+    existing = _existing_index_names(conn)
+    for name, target in _EXTRA_INDEXES:
+        if name in existing:
+            continue
+        conn.execute(f"CREATE INDEX {name} ON {target}")
 
 
 def init_db() -> None:
     with _lock:
         conn = _connect()
         try:
-            if IS_MYSQL:
-                for stmt in MYSQL_SCHEMA:
-                    conn.execute(stmt)
-            elif IS_POSTGRES:
-                for stmt in POSTGRES_SCHEMA:
-                    conn.execute(stmt)
-            else:
-                conn.executescript(SCHEMA)
-                _ensure_asset_columns(conn)
+            # Даже `CREATE TABLE/INDEX IF NOT EXISTS` берёт блокировку таблицы и на
+            # работающих воркерах ловит deadlock со вставками. Поэтому на уже
+            # созданной схеме DDL не выполняем вовсе — только досоздаём недостающее.
+            if not _assets_table_exists(conn):
+                if IS_MYSQL:
+                    for stmt in MYSQL_SCHEMA:
+                        conn.execute(stmt)
+                elif IS_POSTGRES:
+                    for stmt in POSTGRES_SCHEMA:
+                        conn.execute(stmt)
+                else:
+                    conn.executescript(SCHEMA)
+            _ensure_asset_columns(conn)
+            _ensure_extra_indexes(conn)
             conn.commit()
         finally:
             conn.close()
@@ -899,7 +1018,7 @@ def fetch_assets_for_describe(limit: int, only_missing: bool) -> list[dict]:
             if only_missing:
                 cur = conn.execute(
                     """
-                    SELECT path, name, preview_file FROM assets
+                    SELECT path, name, preview_file, preview_key FROM assets
                     WHERE preview_status = 'ok' AND preview_file IS NOT NULL
                       AND (description IS NULL OR description = '')
                     ORDER BY path
@@ -910,7 +1029,7 @@ def fetch_assets_for_describe(limit: int, only_missing: bool) -> list[dict]:
             else:
                 cur = conn.execute(
                     """
-                    SELECT path, name, preview_file FROM assets
+                    SELECT path, name, preview_file, preview_key FROM assets
                     WHERE preview_status = 'ok' AND preview_file IS NOT NULL
                     ORDER BY path
                     LIMIT ?
@@ -918,7 +1037,7 @@ def fetch_assets_for_describe(limit: int, only_missing: bool) -> list[dict]:
                     (limit,),
                 )
             return [
-                {"path": r[0], "name": r[1], "preview_file": r[2]}
+                {"path": r[0], "name": r[1], "preview_file": r[2], "preview_key": r[3]}
                 for r in cur.fetchall()
             ]
         finally:
@@ -956,6 +1075,377 @@ def get_asset_with_description(path: str) -> dict | None:
         finally:
             conn.close()
     return dict(row) if row else None
+
+
+# --------------------------------------------------------------------------- #
+# Ingest: дедупликация по контрольной сумме и регистрация залитых моделей
+# --------------------------------------------------------------------------- #
+def find_by_content_hash(conn, content_hash: str) -> dict | None:
+    """Уже залитая модель с такой же sha256 (защита от дублей)."""
+    row = conn.execute(
+        "SELECT path, name, category, size FROM assets WHERE content_hash = ? LIMIT 1",
+        (content_hash,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def content_hashes_present(hashes: list[str]) -> set[str]:
+    """Какие из переданных sha256 уже есть в каталоге (пакетно, для ingest)."""
+    if not hashes:
+        return set()
+    out: set[str] = set()
+    with _lock:
+        conn = _connect()
+        try:
+            chunk = 400
+            for i in range(0, len(hashes), chunk):
+                part = hashes[i : i + chunk]
+                ph = ",".join("?" * len(part))
+                cur = conn.execute(
+                    f"SELECT content_hash FROM assets WHERE content_hash IN ({ph})", part
+                )
+                out.update(str(r[0]) for r in cur.fetchall() if r[0])
+        finally:
+            conn.close()
+    return out
+
+
+_INGEST_FIELDS = (
+    "name",
+    "ext",
+    "size",
+    "mtime",
+    "content_hash",
+    "category",
+    "collection",
+    "dir_key",
+    "local_dir",
+    "source_url",
+    "preview_file",
+    "preview_key",
+    "preview_source",
+    "preview_status",
+    "vertex_count",
+    "face_count",
+    "mesh_count",
+    "material_count",
+    "texture_count",
+    "animation_count",
+    "has_rig",
+    "bbox_x",
+    "bbox_y",
+    "bbox_z",
+    "meta_json",
+    "ingested_at",
+    "updated_at",
+)
+
+
+def upsert_ingested_asset(conn, path: str, values: dict, now: float) -> None:
+    """Вставляет или обновляет модель, залитую ingest'ом.
+
+    Пишем ровно поля из _INGEST_FIELDS, чтобы повторный ingest не затирал уже
+    полученные от AI описание, теги и классификацию.
+    """
+    payload = {k: values.get(k) for k in _INGEST_FIELDS}
+    payload["updated_at"] = now
+    payload["ingested_at"] = values.get("ingested_at", now)
+
+    exists = conn.execute("SELECT 1 FROM assets WHERE path = ?", (path,)).fetchone()
+    if exists:
+        sets = ", ".join(f"{k} = ?" for k in _INGEST_FIELDS)
+        conn.execute(
+            f"UPDATE assets SET {sets} WHERE path = ?",
+            (*[payload[k] for k in _INGEST_FIELDS], path),
+        )
+        return
+    cols = ("path", "first_seen", *_INGEST_FIELDS)
+    ph = ", ".join("?" * len(cols))
+    conn.execute(
+        f"INSERT INTO assets ({', '.join(cols)}) VALUES ({ph})",
+        (path, now, *[payload[k] for k in _INGEST_FIELDS]),
+    )
+
+
+def set_classification(
+    conn,
+    path: str,
+    *,
+    category: str | None,
+    age_rating: str | None,
+    kid_friendly: bool | None,
+    nsfw: bool | None,
+    now: float,
+) -> None:
+    def flag(x: bool | None) -> int | None:
+        return None if x is None else (1 if x else 0)
+
+    conn.execute(
+        """
+        UPDATE assets SET
+            category = ?, age_rating = ?, kid_friendly = ?, nsfw = ?,
+            classified_at = ?, updated_at = ?
+        WHERE path = ?
+        """,
+        (category, age_rating, flag(kid_friendly), flag(nsfw), now, now, path),
+    )
+
+
+def fetch_assets_for_classification(limit: int, only_missing: bool) -> list[dict]:
+    """Модели с превью, которым ещё не проставлена категория/рейтинг."""
+    with _lock:
+        conn = _connect()
+        try:
+            where = "preview_status = 'ok' AND preview_file IS NOT NULL"
+            if only_missing:
+                where += " AND (classified_at IS NULL OR category IS NULL)"
+            cur = conn.execute(
+                f"""
+                SELECT path, name, preview_file, collection, category
+                FROM assets WHERE {where} ORDER BY path LIMIT ?
+                """,
+                (limit,),
+            )
+            return [
+                {
+                    "path": r[0],
+                    "name": r[1],
+                    "preview_file": r[2],
+                    "collection": r[3],
+                    "category": r[4],
+                }
+                for r in cur.fetchall()
+            ]
+        finally:
+            conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# Поиск с фильтрами на стороне БД (вместо выгрузки всего каталога в память)
+# --------------------------------------------------------------------------- #
+def _tag_subquery(tags: list[str], *, require_all: bool) -> tuple[str, list]:
+    ph = ",".join("?" * len(tags))
+    if require_all:
+        return (
+            f"SELECT path FROM asset_tags WHERE tag IN ({ph}) "
+            f"GROUP BY path HAVING COUNT(DISTINCT tag) = ?",
+            [*tags, len(tags)],
+        )
+    return (f"SELECT DISTINCT path FROM asset_tags WHERE tag IN ({ph})", list(tags))
+
+
+def build_asset_filter(
+    *,
+    tags_any: list[str] | None = None,
+    tags_all: list[str] | None = None,
+    exclude_tags: list[str] | None = None,
+    categories: list[str] | None = None,
+    ext: list[str] | None = None,
+    name_contains: str | None = None,
+    path_prefix: str | None = None,
+    age_ratings: list[str] | None = None,
+    kid_only: bool = False,
+    exclude_nsfw: bool = False,
+    only_with_preview: bool = False,
+    animated: bool | None = None,
+    rigged: bool | None = None,
+    paths_subset: list[str] | None = None,
+) -> tuple[str, list]:
+    """Собирает WHERE для таблицы assets (алиас `a`) и список параметров."""
+    where: list[str] = ["1=1"]
+    params: list = []
+
+    if tags_any:
+        sub, p = _tag_subquery(tags_any, require_all=False)
+        where.append(f"a.path IN ({sub})")
+        params += p
+    if tags_all:
+        sub, p = _tag_subquery(tags_all, require_all=True)
+        where.append(f"a.path IN ({sub})")
+        params += p
+    if exclude_tags:
+        ph = ",".join("?" * len(exclude_tags))
+        where.append(
+            f"NOT EXISTS (SELECT 1 FROM asset_tags t WHERE t.path = a.path AND t.tag IN ({ph}))"
+        )
+        params += exclude_tags
+    if categories:
+        ph = ",".join("?" * len(categories))
+        where.append(f"a.category IN ({ph})")
+        params += categories
+    if ext:
+        ph = ",".join("?" * len(ext))
+        where.append(f"a.ext IN ({ph})")
+        params += ext
+    if name_contains:
+        where.append("(LOWER(a.name) LIKE ? OR LOWER(a.path) LIKE ?)")
+        needle = f"%{name_contains.lower()}%"
+        params += [needle, needle]
+    if path_prefix:
+        where.append("a.path LIKE ?")
+        params.append(f"{path_prefix}%")
+    if age_ratings:
+        ph = ",".join("?" * len(age_ratings))
+        where.append(f"(a.age_rating IN ({ph}) OR a.age_rating IS NULL)")
+        params += age_ratings
+    if kid_only:
+        where.append("a.kid_friendly = 1")
+    if exclude_nsfw:
+        # NULL = ещё не классифицировано: в безопасном режиме такие не показываем.
+        where.append("a.nsfw = 0 AND (a.content_adult IS NULL OR a.content_adult = 0)")
+    if only_with_preview:
+        where.append("a.preview_status = 'ok' AND a.preview_file IS NOT NULL")
+    if animated is not None:
+        # Признак берём из метаданных файла (клипы анимации), а не из тегов AI:
+        # он точный и есть у модели сразу после заливки.
+        where.append(
+            "a.animation_count > 0" if animated
+            else "(a.animation_count IS NULL OR a.animation_count = 0)"
+        )
+    if rigged is not None:
+        where.append("a.has_rig = 1" if rigged else "(a.has_rig IS NULL OR a.has_rig = 0)")
+    if paths_subset is not None:
+        if not paths_subset:
+            return "1=0", []
+        ph = ",".join("?" * len(paths_subset))
+        where.append(f"a.path IN ({ph})")
+        params += paths_subset
+
+    return " AND ".join(where), params
+
+
+_SORTS = {
+    "name": "LOWER(a.name) ASC",
+    "path": "a.path ASC",
+    "newest": "a.ingested_at DESC NULLS LAST, a.first_seen DESC",
+    "oldest": "a.ingested_at ASC NULLS LAST, a.first_seen ASC",
+    "size": "a.size DESC",
+    "size_asc": "a.size ASC",
+    "complexity": "a.face_count DESC NULLS LAST",
+    "simplicity": "a.face_count ASC NULLS LAST",
+}
+
+
+def _order_by(sort: str | None) -> str:
+    clause = _SORTS.get((sort or "name").lower(), _SORTS["name"])
+    if not IS_POSTGRES:
+        # NULLS LAST есть только в PostgreSQL (и SQLite ≥3.30) — для MySQL убираем.
+        if IS_MYSQL:
+            clause = clause.replace(" NULLS LAST", "")
+    return clause
+
+
+def search_assets(
+    *,
+    limit: int = 60,
+    offset: int = 0,
+    sort: str | None = None,
+    **filters,
+) -> tuple[list[dict], int]:
+    """Отфильтрованная страница каталога + общее число совпадений."""
+    where, params = build_asset_filter(**filters)
+    with _lock:
+        conn = _connect()
+        try:
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM assets a WHERE {where}", params
+            ).fetchone()[0]
+            cur = conn.execute(
+                f"SELECT a.* FROM assets a WHERE {where} "
+                f"ORDER BY {_order_by(sort)} LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
+    return rows, int(total)
+
+
+def facet_counts(**filters) -> dict:
+    """Счётчики по категориям, расширениям и тегам для текущего фильтра."""
+    where, params = build_asset_filter(**filters)
+    with _lock:
+        conn = _connect()
+        try:
+            cats = conn.execute(
+                f"SELECT COALESCE(a.category, 'unclassified') AS c, COUNT(*) "
+                f"FROM assets a WHERE {where} GROUP BY c ORDER BY COUNT(*) DESC",
+                params,
+            ).fetchall()
+            exts = conn.execute(
+                f"SELECT a.ext, COUNT(*) FROM assets a WHERE {where} "
+                f"GROUP BY a.ext ORDER BY COUNT(*) DESC",
+                params,
+            ).fetchall()
+            tags = conn.execute(
+                f"SELECT t.tag, COUNT(*) AS n FROM asset_tags t "
+                f"JOIN assets a ON a.path = t.path WHERE {where} "
+                f"GROUP BY t.tag ORDER BY n DESC LIMIT 200",
+                params,
+            ).fetchall()
+            ratings = conn.execute(
+                f"SELECT COALESCE(a.age_rating, 'unrated') AS r, COUNT(*) "
+                f"FROM assets a WHERE {where} GROUP BY r ORDER BY COUNT(*) DESC",
+                params,
+            ).fetchall()
+            flags = conn.execute(
+                f"SELECT "
+                f"SUM(CASE WHEN a.animation_count > 0 THEN 1 ELSE 0 END), "
+                f"SUM(CASE WHEN a.has_rig = 1 THEN 1 ELSE 0 END), "
+                f"COUNT(*) "
+                f"FROM assets a WHERE {where}",
+                params,
+            ).fetchone()
+        finally:
+            conn.close()
+    return {
+        "categories": [{"category": r[0], "count": int(r[1])} for r in cats],
+        "ext": [{"ext": r[0], "count": int(r[1])} for r in exts],
+        "tags": [{"tag": r[0], "count": int(r[1])} for r in tags],
+        "age_ratings": [{"age_rating": r[0], "count": int(r[1])} for r in ratings],
+        "animated": {
+            "yes": int(flags[0] or 0),
+            "no": int(flags[2] or 0) - int(flags[0] or 0),
+        },
+        "rigged": {
+            "yes": int(flags[1] or 0),
+            "no": int(flags[2] or 0) - int(flags[1] or 0),
+        },
+    }
+
+
+def list_category_counts() -> list[dict]:
+    with _lock:
+        conn = _connect()
+        try:
+            cur = conn.execute(
+                "SELECT COALESCE(category, 'unclassified') AS c, COUNT(*) AS n "
+                "FROM assets GROUP BY c ORDER BY n DESC"
+            )
+            return [{"category": r[0], "count": int(r[1])} for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+
+def get_assets_bulk(paths: list[str]) -> dict[str, dict]:
+    """Полные строки моделей по списку путей (для гидратации результатов Qdrant)."""
+    if not paths:
+        return {}
+    out: dict[str, dict] = {}
+    with _lock:
+        conn = _connect()
+        try:
+            chunk = 300
+            for i in range(0, len(paths), chunk):
+                part = paths[i : i + chunk]
+                ph = ",".join("?" * len(part))
+                cur = conn.execute(f"SELECT * FROM assets WHERE path IN ({ph})", part)
+                for r in cur.fetchall():
+                    row = dict(r)
+                    out[row["path"]] = row
+        finally:
+            conn.close()
+    return out
 
 
 def unlink_preview_file(basename: str | None) -> None:

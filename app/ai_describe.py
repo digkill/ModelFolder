@@ -12,18 +12,19 @@ from __future__ import annotations
 import base64
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import app.db as db
 from app import vector_store
+from app.openai_client import make_openai_client
 from app.paths import (
     OPENAI_API_KEY,
-    OPENAI_BASE_URL,
     OPENAI_DESCRIBE_MODEL,
     OPENAI_EMBED_MODEL,
-    OPENAI_ORG_ID,
-    PREVIEWS_DIR,
+    WORKER_CONCURRENCY,
 )
+from app.preview_access import resolve_preview_file
 
 log = logging.getLogger(__name__)
 
@@ -33,23 +34,11 @@ SOURCE_OPENAI = "openai"
 def _openai_client():
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is not set (добавьте в .env или окружение)")
-    from openai import OpenAI
-
-    kw: dict = {"api_key": OPENAI_API_KEY}
-    if OPENAI_BASE_URL:
-        kw["base_url"] = OPENAI_BASE_URL
-    if OPENAI_ORG_ID:
-        kw["organization"] = OPENAI_ORG_ID
-    return OpenAI(**kw)
+    return make_openai_client()
 
 
-def _safe_preview_path(preview_file: str) -> Path | None:
-    png = (PREVIEWS_DIR / preview_file).resolve()
-    try:
-        png.relative_to(PREVIEWS_DIR.resolve())
-    except ValueError:
-        return None
-    return png if png.is_file() else None
+def _safe_preview_path(preview_file: str, preview_key: str | None = None) -> Path | None:
+    return resolve_preview_file(preview_file, preview_key)
 
 
 def describe_image(client, png_path: Path) -> str:
@@ -89,10 +78,21 @@ def embed_text(client, text: str) -> list[float]:
     return list(resp.data[0].embedding)
 
 
-def build_embed_text(name: str, tags: list[str], description: str) -> str:
+def build_embed_text(
+    name: str,
+    tags: list[str],
+    description: str,
+    *,
+    category: str | None = None,
+    collection: str | None = None,
+) -> str:
     parts: list[str] = []
     if name:
         parts.append(f"Name: {name}")
+    if category:
+        parts.append(f"Category: {category}")
+    if collection and collection != name:
+        parts.append(f"Collection: {collection}")
     if tags:
         parts.append(f"Tags: {', '.join(tags)}")
     if description:
@@ -105,16 +105,43 @@ def _tags_for(path: str) -> list[str]:
     return [t["tag"] for t in trows]
 
 
+def _payload_for(path: str, asset: dict | None, tags: list[str], description: str) -> dict:
+    """Payload точки Qdrant: всё, по чему потом фильтруется семантический поиск."""
+    asset = asset or {}
+
+    def flag(value) -> bool | None:
+        return None if value is None else bool(int(value))
+
+    return {
+        "name": asset.get("name"),
+        "description": description,
+        "tags": tags,
+        "category": asset.get("category"),
+        "collection": asset.get("collection"),
+        "ext": asset.get("ext"),
+        "age_rating": asset.get("age_rating"),
+        "nsfw": bool(flag(asset.get("nsfw")) or flag(asset.get("content_adult"))),
+        "kid_friendly": bool(flag(asset.get("kid_friendly"))),
+        "animated": bool(asset.get("animation_count") or 0),
+        "rigged": bool(flag(asset.get("has_rig"))),
+        "face_count": asset.get("face_count"),
+        "size": asset.get("size"),
+    }
+
+
 def _index_one(client, path: str, name: str, description: str, now: float) -> None:
     """Строит эмбеддинг и апсертит модель в Qdrant, помечает embedded_at."""
     tags = _tags_for(path)
-    text = build_embed_text(name, tags, description)
-    vector = embed_text(client, text)
-    vector_store.upsert_model(
-        path,
-        vector,
-        {"name": name, "description": description, "tags": tags},
+    asset = db.get_assets_bulk([path]).get(path)
+    text = build_embed_text(
+        name,
+        tags,
+        description,
+        category=(asset or {}).get("category"),
+        collection=(asset or {}).get("collection"),
     )
+    vector = embed_text(client, text)
+    vector_store.upsert_model(path, vector, _payload_for(path, asset, tags, description))
     with db.write_transaction() as conn:
         db.set_embedded_at(conn, path, now)
 
@@ -129,27 +156,35 @@ def run_describe_batch(*, limit: int = 20, only_missing: bool = True) -> dict:
     processed = 0
     errors: list[str] = []
 
-    for row in rows:
+    def _describe_one(row: dict) -> tuple[str, str | None]:
+        """Описание + эмбеддинг одной модели: всё время уходит на сеть."""
         path = row["path"]
-        png = _safe_preview_path(row["preview_file"])
+        png = _safe_preview_path(row["preview_file"], row.get("preview_key"))
         if png is None:
-            errors.append(f"{path}: preview file missing")
-            continue
+            return path, "preview file missing"
         try:
             now = time.time()
             description = describe_image(client, png)
             if not description:
-                errors.append(f"{path}: empty description")
-                continue
+                return path, "empty description"
             with db.write_transaction() as conn:
                 db.set_description(
                     conn, path, description=description, source=SOURCE_OPENAI, now=now
                 )
             _index_one(client, path, row["name"], description, now)
-            processed += 1
+            return path, None
         except Exception as e:  # noqa: BLE001
             log.warning("Describe/embed failed %s: %s", path, e)
-            errors.append(f"{path}: {e}")
+            return path, str(e)
+
+    # Модели независимы, поэтому обрабатываем пачку параллельно: последовательные
+    # вызовы Vision + embeddings делали обогащение в разы медленнее заливки.
+    with ThreadPoolExecutor(max_workers=max(1, WORKER_CONCURRENCY)) as pool:
+        for path, error in pool.map(_describe_one, rows):
+            if error:
+                errors.append(f"{path}: {error}")
+            else:
+                processed += 1
 
     return {
         "ok": True,
@@ -169,17 +204,26 @@ def run_embed_batch(*, limit: int = 200) -> dict:
     rows = db.fetch_assets_for_embedding(max(1, min(limit, 1000)))
     processed = 0
     errors: list[str] = []
-    for row in rows:
+
+    def _embed_one(row: dict) -> tuple[str, str | None, bool]:
         path = row["path"]
         asset = db.get_asset_with_description(path)
         if not asset or not asset.get("description"):
-            continue
+            # Описание исчезло между выборкой и обработкой — не ошибка и не работа.
+            return path, None, True
         try:
             _index_one(client, path, asset["name"], asset["description"], time.time())
-            processed += 1
+            return path, None, False
         except Exception as e:  # noqa: BLE001
             log.warning("Embed failed %s: %s", path, e)
-            errors.append(f"{path}: {e}")
+            return path, str(e), False
+
+    with ThreadPoolExecutor(max_workers=max(1, WORKER_CONCURRENCY)) as pool:
+        for path, error, skipped in pool.map(_embed_one, rows):
+            if error:
+                errors.append(f"{path}: {error}")
+            elif not skipped:
+                processed += 1
     return {
         "ok": True,
         "processed": processed,
@@ -190,17 +234,22 @@ def run_embed_batch(*, limit: int = 200) -> dict:
 
 
 def _hydrate(hits: list[dict]) -> list[dict]:
-    """Дополняет результаты Qdrant данными из SQLite (актуальные превью/теги)."""
-    tags_map = db.get_tags_bulk([h["path"] for h in hits if h.get("path")])
+    """Дополняет результаты Qdrant данными из БД (актуальные превью/теги/категория)."""
+    paths = [h["path"] for h in hits if h.get("path")]
+    tags_map = db.get_tags_bulk(paths)
+    assets = db.get_assets_bulk(paths)  # одним запросом вместо N штук в цикле
     out: list[dict] = []
     for h in hits:
         path = h.get("path")
-        if not path:
-            continue
-        asset = db.get_asset_with_description(path)
+        asset = assets.get(path) if path else None
         if asset is None:
             continue  # модель удалена из каталога — пропускаем
         payload = h.get("payload") or {}
+        preview_url = (
+            f"/previews/{asset['preview_file']}"
+            if asset.get("preview_status") == "ok" and asset.get("preview_file")
+            else None
+        )
         out.append(
             {
                 "path": path,
@@ -208,6 +257,12 @@ def _hydrate(hits: list[dict]) -> list[dict]:
                 "score": h.get("score"),
                 "description": asset.get("description") or payload.get("description"),
                 "tags": [t["tag"] for t in tags_map.get(path, [])],
+                "category": asset.get("category"),
+                "collection": asset.get("collection"),
+                "ext": asset.get("ext"),
+                "size": asset.get("size"),
+                "age_rating": asset.get("age_rating"),
+                "preview_url": preview_url,
             }
         )
     return out
@@ -233,8 +288,14 @@ def similar_to_path(path: str, *, limit: int = 12) -> dict:
     return {"ok": True, "query": {"path": path}, "results": _hydrate(hits)}
 
 
-def semantic_search(query: str, *, limit: int = 12) -> dict:
-    """Поиск моделей по свободному текстовому запросу на естественном языке."""
+def semantic_search(
+    query: str,
+    *,
+    limit: int = 12,
+    filters: dict | None = None,
+    score_threshold: float | None = None,
+) -> dict:
+    """Поиск моделей по свободному запросу с фильтрами по категории/тегам/рейтингу."""
     if not OPENAI_API_KEY:
         return {"ok": False, "error": "Set OPENAI_API_KEY", "results": []}
     q = (query or "").strip()
@@ -242,5 +303,15 @@ def semantic_search(query: str, *, limit: int = 12) -> dict:
         return {"ok": False, "error": "Empty query", "results": []}
     client = _openai_client()
     vector = embed_text(client, q)
-    hits = vector_store.search(vector, limit=limit)
-    return {"ok": True, "query": {"text": q}, "results": _hydrate(hits)}
+    query_filter = vector_store.build_filter(**(filters or {}))
+    hits = vector_store.search(
+        vector,
+        limit=limit,
+        query_filter=query_filter,
+        score_threshold=score_threshold,
+    )
+    return {
+        "ok": True,
+        "query": {"text": q, "filters": filters or {}},
+        "results": _hydrate(hits),
+    }

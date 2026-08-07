@@ -123,6 +123,21 @@ def _s3():
                 config=Config(
                     s3={"addressing_style": S3_ADDRESSING_STYLE},
                     signature_version="s3v4",
+                    # Свежий botocore по умолчанию шлёт CRC32 в дополнение к
+                    # x-amz-content-sha256; часть S3-совместимых хранилищ (Beget)
+                    # на этом отвечает XAmzContentSHA256Mismatch. Считаем чек-суммы
+                    # только там, где протокол их реально требует.
+                    request_checksum_calculation="when_required",
+                    response_checksum_validation="when_required",
+                    # Канал до S3 периодически рвётся; без повторов заливка
+                    # каталога умирает на первом же сетевом сбое.
+                    retries={"max_attempts": 8, "mode": "standard"},
+                    connect_timeout=20,
+                    read_timeout=120,
+                    # Каждый параллельный upload_file держит несколько соединений
+                    # (multipart), и при дефолтных 10 пул постоянно переполняется:
+                    # boto3 рвёт и заново открывает TLS-сессии, теряя скорость.
+                    max_pool_connections=64,
                 ),
             )
     return _s3_client
@@ -159,11 +174,22 @@ def _s3_iter_objects() -> Iterator[tuple[str, int, float]]:
 def _s3_head(key: str) -> tuple[int, float] | None:
     from botocore.exceptions import ClientError
 
+    resp = _s3().head_object(Bucket=S3_BUCKET, Key=_s3_full_key(key))
+    return int(resp["ContentLength"]), float(resp["LastModified"].timestamp())
+
+
+def _s3_head_or_none(key: str) -> tuple[int, float] | None:
+    """head_object, где «нет объекта» и «сеть отвалилась» — разные вещи.
+
+    ClientError (404/403) означает, что объекта нет. Сетевые ошибки наружу не
+    глушим: иначе ingest примет обрыв связи за «файла ещё нет» и зальёт заново.
+    """
+    from botocore.exceptions import ClientError
+
     try:
-        resp = _s3().head_object(Bucket=S3_BUCKET, Key=_s3_full_key(key))
+        return _s3_head(key)
     except ClientError:
         return None
-    return int(resp["ContentLength"]), float(resp["LastModified"].timestamp())
 
 
 def _s3_cache_path(key: str, size: int, mtime: float) -> Path:
@@ -174,7 +200,7 @@ def _s3_cache_path(key: str, size: int, mtime: float) -> Path:
 
 def _s3_local_path(key: str) -> Path:
     """Скачивает объект в локальный кэш (если ещё нет) и возвращает путь."""
-    head = _s3_head(key)
+    head = _s3_head_or_none(key)
     if head is None:
         raise FileNotFoundError(key)
     size, mtime = head
@@ -201,7 +227,17 @@ def _s3_open_stream(key: str) -> Iterator[bytes]:
 
 
 def _s3_exists(key: str) -> bool:
-    return _s3_head(key) is not None
+    return _s3_head_or_none(key) is not None
+
+
+def _s3_upload(local: Path, key: str, *, content_type: str | None) -> None:
+    extra: dict = {"ContentType": content_type or guess_media_type(key)}
+    # upload_file сам переключается на multipart для крупных файлов.
+    _s3().upload_file(str(local), S3_BUCKET, _s3_full_key(key), ExtraArgs=extra)
+
+
+def _s3_delete(key: str) -> None:
+    _s3().delete_object(Bucket=S3_BUCKET, Key=_s3_full_key(key))
 
 
 # --------------------------------------------------------------------------- #
@@ -251,6 +287,47 @@ def object_exists(key: str) -> bool:
     if is_s3():
         return _s3_exists(key)
     return _local_resolve(key).is_file()
+
+
+def stat_object(key: str) -> tuple[int, float] | None:
+    """(size, mtime) объекта или None, если его нет."""
+    try:
+        key = safe_key(key)
+    except ValueError:
+        return None
+    if is_s3():
+        # Сетевой сбой здесь трактуется как «объекта нет»: ingest тогда просто
+        # зальёт файл заново, а purge посчитает папку неподтверждённой и не удалит.
+        return _s3_head_or_none(key)
+    p = _local_resolve(key)
+    if not p.is_file():
+        return None
+    st = p.stat()
+    return int(st.st_size), float(st.st_mtime)
+
+
+def upload_file(local: Path, key: str, *, content_type: str | None = None) -> None:
+    """Кладёт локальный файл в хранилище под ключом key (перезаписывает)."""
+    key = safe_key(key)
+    if is_s3():
+        _s3_upload(local, key, content_type=content_type)
+        return
+    dst = _local_resolve(key)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst != local.resolve():
+        import shutil
+
+        shutil.copy2(local, dst)
+
+
+def delete_object(key: str) -> None:
+    key = safe_key(key)
+    if is_s3():
+        _s3_delete(key)
+        return
+    p = _local_resolve(key)
+    if p.is_file():
+        p.unlink()
 
 
 def health() -> dict:

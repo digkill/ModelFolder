@@ -1,20 +1,27 @@
 import mimetypes
 import time
 import zipfile
+from html import escape
 from urllib.parse import quote
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import app.db as db
-from app import ai_describe, storage, vector_store
+from app import ai_describe, auth, storage, vector_store
 from app.launch_groups import GroupFilters, get_launch_group, list_launch_groups
-from app.model_catalog import filters_from_query, list_model_items
+from app.model_catalog import filters_from_query, list_model_items, search_model_items
 from app.paths import (
     API_BASE_URL,
     LAUNCH_GROUPS_PATH,
@@ -31,6 +38,14 @@ from app.paths import (
 )
 from app.scanner import run_scan_cycle, start_background_scanner, stop_background_scanner
 from app.tag_normalize import normalize_tag_list
+from app.taxonomy import (
+    AGE_RATINGS,
+    CATEGORIES,
+    CATEGORY_SET,
+    TAG_FACETS,
+    canonical_category,
+    ratings_up_to,
+)
 from app.vision_tags import run_auto_tag_batch
 from app.vpath import ZIP_SEP, is_safe_zip_member, split_vpath
 
@@ -45,6 +60,38 @@ class AppendTagsBody(BaseModel):
 class SemanticSearchBody(BaseModel):
     query: str = Field(..., description="Запрос на естественном языке")
     limit: int = Field(12, ge=1, le=50)
+    category: list[str] = Field(default_factory=list, description="Категории каталога")
+    tags: list[str] = Field(default_factory=list, description="Хотя бы один тег")
+    tags_all: list[str] = Field(default_factory=list, description="Все перечисленные теги")
+    ext: list[str] = Field(default_factory=list)
+    age_max: str | None = Field(None, description="everyone | teen | mature | adult")
+    kid_only: bool = Field(False, description="Только пригодные для детской игры")
+    safe: bool = Field(False, description="Исключить 18+ и неклассифицированное")
+
+
+class CatalogSearchBody(BaseModel):
+    """Фасетный поиск по каталогу; при заданном `query` подмешивается семантика."""
+
+    query: str | None = Field(None, description="Свободный запрос (семантический поиск)")
+    name_contains: str | None = Field(None, description="Подстрока в имени или пути")
+    category: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list, description="Хотя бы один тег")
+    tags_all: list[str] = Field(default_factory=list, description="Все перечисленные теги")
+    exclude_tags: list[str] = Field(default_factory=list)
+    ext: list[str] = Field(default_factory=list)
+    path_prefix: str | None = None
+    age_max: str | None = Field(None, description="everyone | teen | mature | adult")
+    kid_only: bool = False
+    safe: bool = Field(False, description="Исключить 18+ и неклассифицированное")
+    only_with_preview: bool = False
+    animated: bool | None = Field(
+        None, description="true — только анимированные, false — только статичные"
+    )
+    rigged: bool | None = Field(None, description="Наличие скелета (риг)")
+    sort: str = Field("name", description="name | newest | size | complexity | ...")
+    limit: int = Field(60, ge=1, le=200)
+    offset: int = Field(0, ge=0)
+    facets: bool = Field(False, description="Вернуть счётчики категорий/тегов/форматов")
 
 
 class ModelQueryBody(BaseModel):
@@ -164,12 +211,78 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Models gallery", lifespan=lifespan)
 
+
+@app.middleware("http")
+async def require_auth(request: Request, call_next):
+    """Закрывает каталог целиком: и UI, и API, и отдачу файлов моделей."""
+    if not auth.is_enabled() or auth.is_public_path(request.url.path):
+        return await call_next(request)
+    if auth.authenticated_user(request):
+        return await call_next(request)
+    # Браузеру показываем форму, программному клиенту — честный 401.
+    if "text/html" in request.headers.get("accept", ""):
+        target = request.url.path
+        if request.url.query:
+            target = f"{target}?{request.url.query}"
+        return RedirectResponse(f"/login?next={quote(target, safe='')}", status_code=303)
+    return JSONResponse(
+        {"detail": "Authentication required"},
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="ModelFolder"'},
+    )
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Авторизация по cookie: с allow_origins="*" браузер запретит credentials,
+    # поэтому при включённом логине пускаем только собственный источник.
+    allow_origins=["*"] if not auth.is_enabled() else [],
+    allow_credentials=auth.is_enabled(),
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _login_page(next_url: str, error: str | None = None) -> HTMLResponse:
+    page = static_dir / "login.html"
+    if not page.is_file():
+        return HTMLResponse("<p>Missing static/login.html</p>", status_code=500)
+    html = page.read_text(encoding="utf-8")
+    html = html.replace("__NEXT__", escape(next_url or "/", quote=True))
+    if error:
+        html = html.replace("<!--ERROR-->", f'<div class="error">{escape(error)}</div>')
+    return HTMLResponse(html, status_code=200 if not error else 401)
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_form(request: Request, next: str = Query("/")) -> HTMLResponse:
+    if not auth.is_enabled() or auth.authenticated_user(request):
+        return RedirectResponse(next or "/", status_code=303)
+    return _login_page(next)
+
+
+@app.post("/login")
+async def login_submit(request: Request):
+    form = await request.form()
+    username = str(form.get("username") or "")
+    password = str(form.get("password") or "")
+    next_url = str(form.get("next") or "/")
+    if not next_url.startswith("/"):
+        next_url = "/"  # не даём увести пользователя на чужой сайт через ?next=
+    if not auth.verify_credentials(username, password):
+        return _login_page(next_url, error="Неверный логин или пароль")
+    response = RedirectResponse(next_url, status_code=303)
+    forwarded_proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    auth.set_session_cookie(response, username, secure=forwarded_proto == "https")
+    return response
+
+
+@app.get("/logout")
+@app.post("/logout")
+def logout():
+    response = RedirectResponse("/login", status_code=303)
+    auth.clear_session_cookie(response)
+    return response
 
 if static_dir.is_dir():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
@@ -358,6 +471,135 @@ def models_query(
     )
 
 
+def _sql_filters(body: CatalogSearchBody) -> dict:
+    """Пользовательские параметры → аргументы db.build_asset_filter."""
+    return {
+        "tags_any": normalize_tag_list(body.tags),
+        "tags_all": normalize_tag_list(body.tags_all),
+        "exclude_tags": normalize_tag_list(body.exclude_tags),
+        "categories": [c for c in (canonical_category(x) for x in body.category) if c],
+        "ext": [x.lower().lstrip(".") for x in body.ext if str(x).strip()],
+        "name_contains": (body.name_contains or "").strip() or None,
+        "path_prefix": (body.path_prefix or "").strip().replace("\\", "/") or None,
+        "age_ratings": ratings_up_to(body.age_max),
+        "kid_only": body.kid_only,
+        "exclude_nsfw": body.safe,
+        "only_with_preview": body.only_with_preview,
+        "animated": body.animated,
+        "rigged": body.rigged,
+    }
+
+
+@app.get("/api/categories")
+def categories() -> dict:
+    """Категории каталога со счётчиками — основа навигации по большому каталогу."""
+    counts = {row["category"]: row["count"] for row in db.list_category_counts()}
+    return {
+        "categories": [
+            {"category": name, "count": counts.get(name, 0)} for name in CATEGORIES
+        ]
+        + [
+            {"category": name, "count": count}
+            for name, count in counts.items()
+            if name not in CATEGORY_SET
+        ],
+        "age_ratings": list(AGE_RATINGS),
+        "tag_facets": {facet: list(tags) for facet, tags in TAG_FACETS.items()},
+    }
+
+
+@app.post("/api/catalog/search")
+def catalog_search(
+    body: CatalogSearchBody,
+    request: Request,
+    base_url: str | None = Query(None, description="Базовый URL для абсолютных ссылок"),
+) -> dict:
+    """Фасетный поиск: фильтры считаются в БД, семантика — в Qdrant.
+
+    Без `query` это обычная постраничная выдача с фильтрами. С `query` сначала
+    берётся семантическая выборка из Qdrant (с теми же фильтрами в payload), а
+    затем она пересекается с БД — так свободный запрос не ломает фасеты.
+    """
+    filters = _sql_filters(body)
+    resolved_base = _resolve_base_url(request, base_url)
+    query = (body.query or "").strip()
+
+    if query:
+        if not OPENAI_API_KEY:
+            raise HTTPException(
+                status_code=400, detail="Задайте OPENAI_API_KEY для поиска по запросу"
+            )
+        semantic = ai_describe.semantic_search(
+            query,
+            # Берём с запасом: часть попаданий отсеют SQL-фильтры.
+            limit=min(200, (body.offset + body.limit) * 3),
+            filters={
+                "categories": filters["categories"],
+                "tags_any": filters["tags_any"],
+                "tags_all": filters["tags_all"],
+                "age_ratings": filters["age_ratings"],
+                "ext": filters["ext"],
+                "exclude_nsfw": body.safe,
+                "kid_only": body.kid_only,
+                "animated": body.animated,
+            },
+        )
+        if not semantic.get("ok"):
+            raise HTTPException(status_code=400, detail=semantic.get("error", "Search failed"))
+        ranked = [r["path"] for r in semantic["results"]]
+        payload = search_model_items(
+            limit=body.limit,
+            offset=body.offset,
+            sort="path",
+            with_facets=body.facets,
+            base_url=resolved_base,
+            paths_subset=ranked,
+            **{k: v for k, v in filters.items()},
+        )
+        # Возвращаем порядок Qdrant: SQL отдал строки, но релевантность знает он.
+        order = {path: i for i, path in enumerate(ranked)}
+        payload["items"].sort(key=lambda item: order.get(item["path"], len(order)))
+        payload["query"] = query
+        return payload
+
+    return search_model_items(
+        limit=body.limit,
+        offset=body.offset,
+        sort=body.sort,
+        with_facets=body.facets,
+        base_url=resolved_base,
+        **filters,
+    )
+
+
+@app.get("/api/preview")
+def serve_preview(path: str = Query(..., description="Путь модели в каталоге")):
+    """Превью модели: локальный PNG, если он есть, иначе оригинал из хранилища.
+
+    Ingest работает на одной машине, а отдаёт каталог другая — на ней локальных
+    PNG нет, зато исходная картинка лежит в хранилище рядом с моделью.
+    """
+    row = db.get_assets_bulk([path]).get(path)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Unknown model path")
+    basename = row.get("preview_file")
+    if basename and row.get("preview_status") == "ok":
+        local = (PREVIEWS_DIR / basename).resolve()
+        try:
+            local.relative_to(PREVIEWS_DIR.resolve())
+        except ValueError:
+            local = None
+        if local is not None and local.is_file():
+            return FileResponse(local, media_type="image/png")
+    preview_key = row.get("preview_key")
+    if not preview_key or not storage.object_exists(preview_key):
+        raise HTTPException(status_code=404, detail="Preview not available")
+    return StreamingResponse(
+        storage.open_stream(preview_key),
+        media_type=storage.guess_media_type(preview_key),
+    )
+
+
 @app.get("/api/tag-list")
 def tag_list() -> dict:
     return {"tags": db.list_tag_counts()}
@@ -446,7 +688,19 @@ def search_semantic(body: SemanticSearchBody) -> dict:
     """Поиск моделей по описанию на естественном языке (например «sci-fi робот с оружием»)."""
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=400, detail="Задайте OPENAI_API_KEY")
-    result = ai_describe.semantic_search(body.query, limit=body.limit)
+    result = ai_describe.semantic_search(
+        body.query,
+        limit=body.limit,
+        filters={
+            "categories": [c for c in (canonical_category(x) for x in body.category) if c],
+            "tags_any": normalize_tag_list(body.tags),
+            "tags_all": normalize_tag_list(body.tags_all),
+            "ext": [x.lower().lstrip(".") for x in body.ext if str(x).strip()],
+            "age_ratings": ratings_up_to(body.age_max),
+            "exclude_nsfw": body.safe,
+            "kid_only": body.kid_only,
+        },
+    )
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error", "Search failed"))
     return result

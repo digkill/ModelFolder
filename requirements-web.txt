@@ -1,0 +1,16 @@
+# Зависимости витрины (только чтение каталога и отдача файлов).
+#
+# Отличие от requirements.txt: нет trimesh/pyrender/playwright — рендер превью
+# делает ingest на машине с моделями, а витрина берёт готовые картинки из S3.
+# Это убирает Chromium и OpenGL из образа: ~2.5 ГБ и несколько минут сборки.
+fastapi>=0.115.0
+python-dotenv>=1.0.0
+uvicorn[standard]>=0.32.0
+numpy>=1.26.0
+Pillow>=10.0.0
+openai>=1.55.0
+qdrant-client>=1.12.0
+boto3>=1.35.0
+psycopg2-binary>=2.9.9
+PyMySQL>=1.1.0
+python-multipart>=0.0.9

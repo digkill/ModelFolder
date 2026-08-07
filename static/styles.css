@@ -230,6 +230,14 @@ main {
   color: #f28b82;
 }
 
+/* Маркер конца списка — он же индикатор подгрузки следующей страницы. */
+.scroll-sentinel {
+  padding: 1.5rem;
+  text-align: center;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));

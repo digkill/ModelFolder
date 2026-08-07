@@ -1,0 +1,33 @@
+# Витрина каталога: FastAPI + статика, без рендера превью.
+#
+# Превью и метаданные готовит `python -m app.ingest` на машине с моделями,
+# поэтому здесь не нужны ни Chromium, ни OpenGL — образ на порядок легче
+# основного Dockerfile и помещается на небольшой сервер.
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements-web.txt ./
+RUN pip install --upgrade pip && pip install -r requirements-web.txt
+
+COPY app ./app
+COPY static ./static
+
+# Сканер выключен: каталог наполняет ingest, витрина только читает БД.
+ENV DATA_DIR=/data/app \
+    RUN_SCANNER=0 \
+    STORAGE_BACKEND=s3
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8000/api/health || exit 1
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

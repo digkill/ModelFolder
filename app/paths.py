@@ -4,8 +4,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-# Централизованная конфигурация: переменные из `.env` в корне проекта (не перезаписывают уже выставленные в shell).
-load_dotenv(_PROJECT_ROOT / ".env")
+# Централизованная конфигурация: переменные из `.env` в корне проекта.
+# override=True: на машине разработчика в системных переменных Windows (User/Machine)
+# может висеть чужой OPENAI_API_KEY от другого проекта — без override он молча
+# перебивает .env, и приложение шлёт запросы под чужим ключом без единой ошибки в логах.
+load_dotenv(_PROJECT_ROOT / ".env", override=True)
 
 MODELS_ROOT = Path(
     os.environ.get("MODELS_DIR", _PROJECT_ROOT / "models")
@@ -65,6 +68,10 @@ WORKER_TAG_BATCH = int(os.environ.get("WORKER_TAG_BATCH", "20"))
 WORKER_DESCRIBE_BATCH = int(os.environ.get("WORKER_DESCRIBE_BATCH", "20"))
 WORKER_DO_TAGS = _env_bool("WORKER_DO_TAGS", True)
 WORKER_DO_DESCRIBE = _env_bool("WORKER_DO_DESCRIBE", True)
+# Сколько запросов к OpenAI держать в полёте одновременно. Вызовы полностью
+# сетевые (~4 с каждый), поэтому последовательная обработка пачки — главный
+# тормоз обогащения. Упирается в rate limit аккаунта, а не в CPU.
+WORKER_CONCURRENCY = int(os.environ.get("WORKER_CONCURRENCY", "8"))
 # В приложении можно отключить встроенный сканер, если сканирование делает воркер.
 RUN_SCANNER = _env_bool("RUN_SCANNER", True)
 
@@ -100,6 +107,9 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 # Дополнительно для официального SDK (прокси / совместимые эндпоинты).
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "").strip() or None
 OPENAI_ORG_ID = os.environ.get("OPENAI_ORG_ID", "").strip() or None
+# SOCKS5/HTTP-прокси для запросов к OpenAI (например "socks5h://127.0.0.1:18081"),
+# когда прямой маршрут с этой машины до api.openai.com нестабилен.
+OPENAI_PROXY_URL = os.environ.get("OPENAI_PROXY_URL", "").strip() or None
 
 # --- AI-описания моделей (для семантического поиска похожих) ---
 # Модель для генерации текстового описания по превью (vision).
@@ -116,6 +126,15 @@ QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY", "").strip() or None
 QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "models").strip()
 
+# --- Авторизация витрины ---
+# Пустой логин или пароль = авторизация выключена (локальная разработка).
+AUTH_USERNAME = os.environ.get("AUTH_USERNAME", "").strip()
+AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "")
+# Секрет подписи cookie. Если не задан — выводится из пароля (сессии переживают
+# рестарт, но инвалидируются при смене пароля, что и требуется).
+AUTH_SECRET = os.environ.get("AUTH_SECRET", "").strip()
+AUTH_SESSION_TTL_SEC = int(os.environ.get("AUTH_SESSION_TTL_SEC", str(30 * 24 * 3600)))
+
 # Группы запуска для внешних клиентов API (JSON: id, filters, unit_main).
 LAUNCH_GROUPS_PATH = Path(
     os.environ.get("LAUNCH_GROUPS_PATH", DATA_DIR / "launch_groups.json")
@@ -124,6 +143,21 @@ LAUNCH_GROUPS_PATH = Path(
 # Базовый URL для абсолютных ссылок в ответах API (например http://127.0.0.1:8000).
 API_BASE_URL = os.environ.get("API_BASE_URL", "").strip().rstrip("/") or None
 
-MODEL_EXTENSIONS = {".fbx", ".glb", ".gltf", ".usdz", ".flb"}
+MODEL_EXTENSIONS = {".fbx", ".glb", ".gltf", ".usdz", ".flb", ".obj", ".stl"}
 
 PREVIEW_EXTENSIONS = {".glb", ".gltf", ".fbx"}
+
+# Картинки, которые считаются готовым превью рядом с моделью (ingest ищет пару
+# «модель + одноимённая картинка»).
+INGEST_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+# --- Ingest: заливка каталога с локального диска в хранилище ---
+# Корень, который обходит `python -m app.ingest` (папка = модель + превью).
+INGEST_ROOT = Path(
+    os.environ.get("INGEST_ROOT", MODELS_ROOT)
+).resolve()
+# Параллельные заливки файлов в S3 (IO-bound, не CPU).
+INGEST_WORKERS = int(os.environ.get("INGEST_WORKERS", "4"))
+# Файлы крупнее порога заливаются multipart'ом самим boto3; здесь — защита от
+# случайного затаскивания гигантских архивов, 0 = без ограничения.
+INGEST_MAX_FILE_MB = int(os.environ.get("INGEST_MAX_FILE_MB", "0"))

@@ -48,8 +48,22 @@ def get_client():
     return _client
 
 
+# Поля payload, по которым идёт фильтрация. Без индекса Qdrant делает полный
+# перебор — на десятках тысяч точек это заметно медленнее.
+_PAYLOAD_INDEXES = {
+    "category": "keyword",
+    "tags": "keyword",
+    "age_rating": "keyword",
+    "ext": "keyword",
+    "nsfw": "bool",
+    "kid_friendly": "bool",
+    "animated": "bool",
+    "face_count": "integer",
+}
+
+
 def ensure_collection() -> None:
-    """Создаёт коллекцию при первом обращении (idempotent)."""
+    """Создаёт коллекцию и индексы payload при первом обращении (idempotent)."""
     global _collection_ready
     if _collection_ready:
         return
@@ -64,7 +78,53 @@ def ensure_collection() -> None:
                 collection_name=QDRANT_COLLECTION,
                 vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
             )
+        for field, schema in _PAYLOAD_INDEXES.items():
+            try:
+                client.create_payload_index(
+                    collection_name=QDRANT_COLLECTION,
+                    field_name=field,
+                    field_schema=schema,
+                )
+            except Exception as e:  # индекс уже есть — это нормально
+                log.debug("Payload index %s: %s", field, e)
         _collection_ready = True
+
+
+def build_filter(
+    *,
+    categories: list[str] | None = None,
+    tags_any: list[str] | None = None,
+    tags_all: list[str] | None = None,
+    age_ratings: list[str] | None = None,
+    ext: list[str] | None = None,
+    exclude_nsfw: bool = False,
+    kid_only: bool = False,
+    animated: bool | None = None,
+):
+    """Собирает qdrant-фильтр по payload. None — если фильтровать нечего."""
+    from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
+
+    must: list = []
+    if categories:
+        must.append(FieldCondition(key="category", match=MatchAny(any=list(categories))))
+    if tags_any:
+        must.append(FieldCondition(key="tags", match=MatchAny(any=list(tags_any))))
+    if tags_all:
+        # MatchAny — это OR, поэтому «все теги» выражаются набором отдельных условий.
+        must.extend(
+            FieldCondition(key="tags", match=MatchValue(value=tag)) for tag in tags_all
+        )
+    if age_ratings:
+        must.append(FieldCondition(key="age_rating", match=MatchAny(any=list(age_ratings))))
+    if ext:
+        must.append(FieldCondition(key="ext", match=MatchAny(any=list(ext))))
+    if exclude_nsfw:
+        must.append(FieldCondition(key="nsfw", match=MatchValue(value=False)))
+    if kid_only:
+        must.append(FieldCondition(key="kid_friendly", match=MatchValue(value=True)))
+    if animated is not None:
+        must.append(FieldCondition(key="animated", match=MatchValue(value=bool(animated))))
+    return Filter(must=must) if must else None
 
 
 def upsert_model(path: str, vector: list[float], payload: dict) -> None:
@@ -101,6 +161,8 @@ def search(
     *,
     limit: int = 12,
     exclude_path: str | None = None,
+    query_filter=None,
+    score_threshold: float | None = None,
 ) -> list[dict]:
     ensure_collection()
     client = get_client()
@@ -110,6 +172,8 @@ def search(
         query=vector,
         limit=limit + (1 if exclude_path else 0),
         with_payload=True,
+        query_filter=query_filter,
+        score_threshold=score_threshold,
     ).points
     results: list[dict] = []
     for h in hits:
