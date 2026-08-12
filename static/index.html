@@ -18,7 +18,11 @@
       </div>
       <div class="toolbar toolbar-stack">
         <div class="toolbar-row">
-          <input type="search" id="filter" placeholder="Фильтр по имени, пути или тегу…" autocomplete="off" />
+          <input type="search" id="filter" placeholder="Поиск: «робот с оружием», «низкополигональный дом»…" autocomplete="off" />
+          <label class="switch" title="Искать по смыслу описания через Qdrant, а не по совпадению в названии">
+            <input type="checkbox" id="semantic-search" checked />
+            <span>по смыслу</span>
+          </label>
           <button type="button" class="ghost" id="reload">Обновить</button>
         </div>
         <div class="toolbar-row tag-toolbar">
@@ -33,6 +37,25 @@
             placeholder="Теги через запятую: character, vehicle…"
             autocomplete="off"
           />
+          <select id="filter-collection" class="filter-select" title="Показать только модели из подборки">
+            <option value="">Все подборки</option>
+          </select>
+          <select id="filter-rating" class="filter-select" title="Минимальная оценка">
+            <option value="">Любая оценка</option>
+            <option value="5">★★★★★</option>
+            <option value="4">★★★★ и выше</option>
+            <option value="3">★★★ и выше</option>
+            <option value="2">★★ и выше</option>
+            <option value="1">★ и выше</option>
+          </select>
+          <select id="sort" class="filter-select" title="Сортировка">
+            <option value="name">По имени</option>
+            <option value="rating">По оценке</option>
+            <option value="newest">Сначала новые</option>
+            <option value="size">По размеру</option>
+            <option value="complexity">По сложности</option>
+          </select>
+          <a class="ghost" href="/admin" title="Загрузка моделей и статистика">Админка</a>
           <button type="button" class="ghost" id="tag-ai" title="Нужен OPENAI_API_KEY на сервере">
             Теги ИИ
           </button>

@@ -251,7 +251,11 @@ let exhausted = false;
 let requestSeq = 0;
 
 function buildSearchBody() {
-  const body = { limit: PAGE_SIZE, offset, sort: "name" };
+  const body = {
+    limit: PAGE_SIZE,
+    offset,
+    sort: document.getElementById("sort").value || "name",
+  };
   const raw = document.getElementById("filter-tags").value.trim();
   if (raw) {
     const tags = raw.split(",").map((s) => s.trim()).filter(Boolean);
@@ -259,8 +263,151 @@ function buildSearchBody() {
     else body.tags = tags;
   }
   const q = document.getElementById("filter").value.trim();
-  if (q) body.name_contains = q;
+  if (q) {
+    // `query` уходит в Qdrant по смыслу описания, `name_contains` — точное
+    // совпадение в имени. Разные задачи, поэтому переключатель, а не угадывание.
+    if (document.getElementById("semantic-search").checked) body.query = q;
+    else body.name_contains = q;
+  }
+  const col = document.getElementById("filter-collection").value;
+  if (col) body.collection_id = Number(col);
+  const rating = document.getElementById("filter-rating").value;
+  if (rating) body.min_rating = Number(rating);
   return body;
+}
+
+// --- подборки ------------------------------------------------------------- //
+let collections = [];
+
+async function loadCollections() {
+  try {
+    const res = await fetch("/api/collections");
+    if (!res.ok) return;
+    collections = (await res.json()).collections || [];
+  } catch {
+    collections = [];
+  }
+  const sel = document.getElementById("filter-collection");
+  const current = sel.value;
+  sel.innerHTML = '<option value="">Все подборки</option>';
+  for (const c of collections) {
+    const opt = document.createElement("option");
+    opt.value = String(c.id);
+    opt.textContent = `${c.name} (${c.count})`;
+    sel.appendChild(opt);
+  }
+  sel.value = current;
+}
+
+async function toggleCollection(collectionId, path, member) {
+  await fetch(`/api/collections/${collectionId}/items`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, member }),
+  });
+  loadCollections();
+}
+
+async function createCollection(name) {
+  const res = await fetch("/api/collections", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) return null;
+  const created = await res.json();
+  await loadCollections();
+  return created;
+}
+
+function openCollectionMenu(anchor, item) {
+  document.querySelectorAll(".collection-menu").forEach((el) => el.remove());
+  const menu = document.createElement("div");
+  menu.className = "collection-menu";
+  menu.addEventListener("click", (e) => e.stopPropagation());
+
+  for (const c of collections) {
+    const row = document.createElement("label");
+    row.className = "collection-row";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = (item.collection_ids || []).includes(c.id);
+    cb.addEventListener("change", async () => {
+      await toggleCollection(c.id, item.path, cb.checked);
+      item.collection_ids = cb.checked
+        ? [...(item.collection_ids || []), c.id]
+        : (item.collection_ids || []).filter((x) => x !== c.id);
+      anchor.classList.toggle("active", (item.collection_ids || []).length > 0);
+    });
+    const span = document.createElement("span");
+    span.textContent = c.name;
+    row.append(cb, span);
+    menu.appendChild(row);
+  }
+
+  const form = document.createElement("form");
+  form.className = "collection-new";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.placeholder = "Новая подборка…";
+  const add = document.createElement("button");
+  add.type = "submit";
+  add.textContent = "+";
+  form.append(input, add);
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const name = input.value.trim();
+    if (!name) return;
+    const created = await createCollection(name);
+    if (created) {
+      await toggleCollection(created.id, item.path, true);
+      item.collection_ids = [...(item.collection_ids || []), created.id];
+      anchor.classList.add("active");
+      menu.remove();
+    }
+  });
+  menu.appendChild(form);
+
+  anchor.parentElement.appendChild(menu);
+  setTimeout(() => {
+    document.addEventListener("click", () => menu.remove(), { once: true });
+  }, 0);
+}
+
+async function setRating(path, rating) {
+  await fetch("/api/models/rating", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, rating }),
+  });
+}
+
+function buildStars(item) {
+  const wrap = document.createElement("div");
+  wrap.className = "stars";
+  wrap.title = "Оценка модели";
+  wrap.addEventListener("click", (e) => e.stopPropagation());
+  const render = () => {
+    wrap.innerHTML = "";
+    for (let i = 1; i <= 5; i += 1) {
+      const star = document.createElement("button");
+      star.type = "button";
+      star.className = `star ${item.rating && i <= item.rating ? "on" : ""}`;
+      star.textContent = "★";
+      star.setAttribute("aria-label", `Оценка ${i}`);
+      star.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        // Повторный клик по той же звезде снимает оценку.
+        const value = item.rating === i ? null : i;
+        item.rating = value;
+        render();
+        await setRating(item.path, value);
+      });
+      wrap.appendChild(star);
+    }
+  };
+  render();
+  return wrap;
 }
 
 async function fetchPage(seq) {
@@ -466,6 +613,28 @@ function appendItems(list) {
       br.appendChild(a);
       body.appendChild(br);
     }
+
+    // Панель действий: оценка и подборки. Клики по ней не должны открывать
+    // просмотрщик, поэтому всплытие гасится внутри самих виджетов.
+    const actions = document.createElement("div");
+    actions.className = "card-actions";
+    actions.appendChild(buildStars(it));
+
+    const collectBtn = document.createElement("button");
+    collectBtn.type = "button";
+    collectBtn.className = `collect-btn ${(it.collection_ids || []).length ? "active" : ""}`;
+    collectBtn.textContent = "♥";
+    collectBtn.title = "Добавить в подборку";
+    collectBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openCollectionMenu(collectBtn, it);
+    });
+    const collectWrap = document.createElement("div");
+    collectWrap.className = "collect-wrap";
+    collectWrap.addEventListener("click", (e) => e.stopPropagation());
+    collectWrap.appendChild(collectBtn);
+    actions.appendChild(collectWrap);
+    body.appendChild(actions);
 
     card.appendChild(preview);
     card.appendChild(body);
@@ -750,5 +919,11 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closeModal();
 });
 
+document.getElementById("semantic-search").addEventListener("change", () => loadModels());
+document.getElementById("filter-collection").addEventListener("change", () => loadModels());
+document.getElementById("filter-rating").addEventListener("change", () => loadModels());
+document.getElementById("sort").addEventListener("change", () => loadModels());
+
 initInfiniteScroll();
+loadCollections();
 loadModels();

@@ -143,6 +143,16 @@ LAUNCH_GROUPS_PATH = Path(
 # Базовый URL для абсолютных ссылок в ответах API (например http://127.0.0.1:8000).
 API_BASE_URL = os.environ.get("API_BASE_URL", "").strip().rstrip("/") or None
 
+# --- ЮKassa (оплата счетов) ---
+YOOKASSA_SHOP_ID = os.environ.get("YOOKASSA_SHOP_ID", "").strip()
+YOOKASSA_SECRET_KEY = os.environ.get("YOOKASSA_SECRET_KEY", "").strip()
+# Куда вернуть плательщика после оплаты. Пусто = {API_BASE_URL}/pay/return
+YOOKASSA_RETURN_URL = os.environ.get("YOOKASSA_RETURN_URL", "").strip().rstrip("/") or None
+# 1 = без НДС. См. https://yookassa.ru/developers/payment-acceptance/receipts/54fz/yoomoney/parameters-values#vat-codes
+YOOKASSA_VAT_CODE = int(os.environ.get("YOOKASSA_VAT_CODE", "1"))
+# 1 = чек 54-ФЗ, если у клиента есть email.
+YOOKASSA_RECEIPT = os.environ.get("YOOKASSA_RECEIPT", "1").strip().lower() not in ("0", "false", "no")
+
 MODEL_EXTENSIONS = {".fbx", ".glb", ".gltf", ".usdz", ".flb", ".obj", ".stl"}
 
 PREVIEW_EXTENSIONS = {".glb", ".gltf", ".fbx"}
@@ -161,3 +171,9 @@ INGEST_WORKERS = int(os.environ.get("INGEST_WORKERS", "4"))
 # Файлы крупнее порога заливаются multipart'ом самим boto3; здесь — защита от
 # случайного затаскивания гигантских архивов, 0 = без ограничения.
 INGEST_MAX_FILE_MB = int(os.environ.get("INGEST_MAX_FILE_MB", "0"))
+# Как искать превью рядом с моделью:
+#   strict — только картинка с тем же именем (исходное правило);
+#   any    — если одноимённой нет, взять подходящую картинку из папки.
+# Второе открывает тысячи моделей, у которых превью лежит рядом под именем
+# вроде preview.png, но требует аккуратности в папках с несколькими моделями.
+INGEST_PREVIEW_MATCH = os.environ.get("INGEST_PREVIEW_MATCH", "strict").strip().lower()

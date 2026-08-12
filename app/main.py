@@ -19,9 +19,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import app.db as db
-from app import ai_describe, auth, storage, vector_store
+from app import admin, ai_describe, api_keys, auth, storage, vector_store
 from app.launch_groups import GroupFilters, get_launch_group, list_launch_groups
 from app.model_catalog import filters_from_query, list_model_items, search_model_items
+from app.service_api import router as service_router
+from app.yookassa import router as yookassa_router
 from app.paths import (
     API_BASE_URL,
     LAUNCH_GROUPS_PATH,
@@ -35,6 +37,8 @@ from app.paths import (
     PREVIEW_SUBPROCESS_TIMEOUT_SEC,
     PREVIEWS_DIR,
     QDRANT_COLLECTION,
+    YOOKASSA_SECRET_KEY,
+    YOOKASSA_SHOP_ID,
 )
 from app.scanner import run_scan_cycle, start_background_scanner, stop_background_scanner
 from app.tag_normalize import normalize_tag_list
@@ -50,6 +54,10 @@ from app.vision_tags import run_auto_tag_batch
 from app.vpath import ZIP_SEP, is_safe_zip_member, split_vpath
 
 static_dir = Path(__file__).resolve().parent.parent / "static"
+
+# Сколько ближайших по смыслу моделей забирать из Qdrant под один запрос.
+# Из этого пула затем отсеиваются несовпавшие по SQL-фильтрам и режется страница.
+SEMANTIC_CANDIDATES = 300
 
 
 class AppendTagsBody(BaseModel):
@@ -67,6 +75,21 @@ class SemanticSearchBody(BaseModel):
     age_max: str | None = Field(None, description="everyone | teen | mature | adult")
     kid_only: bool = Field(False, description="Только пригодные для детской игры")
     safe: bool = Field(False, description="Исключить 18+ и неклассифицированное")
+
+
+class CollectionBody(BaseModel):
+    name: str = Field(..., description="Название подборки")
+    color: str | None = Field(None, description="Цвет метки, например #4b7bec")
+
+
+class CollectionItemBody(BaseModel):
+    path: str = Field(..., description="Путь модели в каталоге")
+    member: bool = Field(True, description="true — добавить, false — убрать")
+
+
+class RatingBody(BaseModel):
+    path: str
+    rating: int | None = Field(None, ge=1, le=5, description="1–5 звёзд, null снимает оценку")
 
 
 class CatalogSearchBody(BaseModel):
@@ -88,6 +111,9 @@ class CatalogSearchBody(BaseModel):
         None, description="true — только анимированные, false — только статичные"
     )
     rigged: bool | None = Field(None, description="Наличие скелета (риг)")
+    collection_id: int | None = Field(None, description="Только модели из подборки")
+    min_rating: int | None = Field(None, ge=1, le=5, description="Оценка не ниже")
+    unrated_only: bool = Field(False, description="Только неоценённые")
     sort: str = Field("name", description="name | newest | size | complexity | ...")
     limit: int = Field(60, ge=1, le=200)
     offset: int = Field(0, ge=0)
@@ -209,13 +235,49 @@ async def lifespan(app: FastAPI):
     stop_background_scanner()
 
 
-app = FastAPI(title="Models gallery", lifespan=lifespan)
+app = FastAPI(
+    title="ModelFolder",
+    description=(
+        "Каталог 3D-моделей. Сервисная выдача для внешних клиентов — `/v1` "
+        "(ключ `Authorization: Bearer mfk_…`). Витрина и админка — cookie / HTTP Basic."
+    ),
+    lifespan=lifespan,
+)
 
 
 @app.middleware("http")
 async def require_auth(request: Request, call_next):
-    """Закрывает каталог целиком: и UI, и API, и отдачу файлов моделей."""
-    if not auth.is_enabled() or auth.is_public_path(request.url.path):
+    """Витрина закрыта логином; /v1 открывается API-ключом."""
+    client = api_keys.authenticate(request)
+    request.state.api_client = client
+
+    path = request.url.path
+    if auth.is_service_path(path):
+        raw_key = api_keys.extract_raw_key(request)
+        if raw_key and client is None:
+            return JSONResponse(
+                {"detail": "Invalid or revoked API key"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if client is not None or not auth.is_enabled() or auth.authenticated_user(request):
+            response = await call_next(request)
+            limit_info = getattr(request.state, "rate_limit", None)
+            if limit_info:
+                limit, remaining = limit_info
+                if limit:
+                    response.headers["X-RateLimit-Limit"] = str(limit)
+                    response.headers["X-RateLimit-Remaining"] = str(remaining)
+            return response
+        return JSONResponse(
+            {
+                "detail": "API key required. Send Authorization: Bearer mfk_… or X-API-Key.",
+            },
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not auth.is_enabled() or auth.is_public_path(path):
         return await call_next(request)
     if auth.authenticated_user(request):
         return await call_next(request)
@@ -284,8 +346,20 @@ def logout():
     auth.clear_session_cookie(response)
     return response
 
+app.include_router(admin.router)
+app.include_router(service_router)
+app.include_router(yookassa_router)
+
 if static_dir.is_dir():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page() -> HTMLResponse:
+    page = static_dir / "admin.html"
+    if not page.is_file():
+        return HTMLResponse("<p>Missing static/admin.html</p>", status_code=500)
+    return HTMLResponse(page.read_text(encoding="utf-8"))
 
 if PREVIEWS_DIR.is_dir():
     app.mount("/previews", StaticFiles(directory=str(PREVIEWS_DIR)), name="previews")
@@ -320,6 +394,8 @@ def health() -> dict:
         "launch_groups_path": str(LAUNCH_GROUPS_PATH),
         "launch_groups_configured": LAUNCH_GROUPS_PATH.is_file(),
         "api_base_url": API_BASE_URL,
+        "service_api": "/v1",
+        "yookassa_configured": bool(YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY),
     }
 
 
@@ -487,7 +563,61 @@ def _sql_filters(body: CatalogSearchBody) -> dict:
         "only_with_preview": body.only_with_preview,
         "animated": body.animated,
         "rigged": body.rigged,
+        "collection_id": body.collection_id,
+        "min_rating": body.min_rating,
+        "unrated_only": body.unrated_only,
     }
+
+
+@app.get("/api/collections")
+def collections_list() -> dict:
+    """Пользовательские подборки — «избранное» под разные задачи."""
+    return {"collections": db.list_collections()}
+
+
+@app.post("/api/collections")
+def collection_create(body: CollectionBody) -> dict:
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Пустое название подборки")
+    return db.create_collection(name[:120], (body.color or "").strip() or None, time.time())
+
+
+@app.patch("/api/collections/{collection_id}")
+def collection_rename(collection_id: int, body: CollectionBody) -> dict:
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Пустое название подборки")
+    db.rename_collection(collection_id, name[:120], (body.color or "").strip() or None)
+    return {"ok": True, "id": collection_id, "name": name}
+
+
+@app.delete("/api/collections/{collection_id}")
+def collection_delete(collection_id: int) -> dict:
+    db.delete_collection(collection_id)
+    return {"ok": True, "id": collection_id}
+
+
+@app.post("/api/collections/{collection_id}/items")
+def collection_set_item(collection_id: int, body: CollectionItemBody) -> dict:
+    """Добавляет или убирает модель из подборки (одна модель — сколько угодно подборок)."""
+    with db.write_transaction() as conn:
+        if not db.get_row(conn, body.path):
+            raise HTTPException(status_code=404, detail="Модель не найдена")
+    db.set_collection_membership(collection_id, body.path, body.member, time.time())
+    return {"ok": True, "collection_id": collection_id, "path": body.path, "member": body.member}
+
+
+@app.post("/api/models/rating")
+def set_rating(body: RatingBody) -> dict:
+    """Оценка модели от 1 до 5 звёзд; null снимает оценку."""
+    if body.rating is not None and not (1 <= body.rating <= 5):
+        raise HTTPException(status_code=400, detail="Рейтинг должен быть от 1 до 5")
+    with db.write_transaction() as conn:
+        if not db.get_row(conn, body.path):
+            raise HTTPException(status_code=404, detail="Модель не найдена")
+    db.set_rating(body.path, body.rating, time.time())
+    return {"ok": True, "path": body.path, "rating": body.rating}
 
 
 @app.get("/api/categories")
@@ -531,8 +661,10 @@ def catalog_search(
             )
         semantic = ai_describe.semantic_search(
             query,
-            # Берём с запасом: часть попаданий отсеют SQL-фильтры.
-            limit=min(200, (body.offset + body.limit) * 3),
+            # Пул кандидатов фиксированный, а не от размера страницы: иначе на
+            # первой странице Qdrant отдаёт единицы, счётчик «найдено» врёт,
+            # а прокрутка упирается в конец выдачи.
+            limit=SEMANTIC_CANDIDATES,
             filters={
                 "categories": filters["categories"],
                 "tags_any": filters["tags_any"],

@@ -108,7 +108,12 @@ def _preview_url(row: dict) -> str | None:
     return None
 
 
-def build_item(row: dict, tag_rows: list[dict], base_url: str | None = None) -> dict:
+def build_item(
+    row: dict,
+    tag_rows: list[dict],
+    base_url: str | None = None,
+    collection_ids: list[int] | None = None,
+) -> dict:
     """Единое представление модели для всех эндпоинтов каталога."""
     path = str(row["path"])
     tag_strings = [x["tag"] for x in tag_rows]
@@ -141,6 +146,8 @@ def build_item(row: dict, tag_rows: list[dict], base_url: str | None = None) -> 
         # Флаги верхнего уровня: по ним фильтрует UI, поэтому дублируем из geometry.
         "animated": bool(row.get("animation_count") or 0),
         "rigged": bool(_db_bool(row.get("has_rig"))),
+        "rating": row.get("rating"),
+        "collection_ids": collection_ids or [],
         "geometry": {
             "vertices": row.get("vertex_count"),
             "faces": row.get("face_count"),
@@ -178,6 +185,16 @@ def build_item(row: dict, tag_rows: list[dict], base_url: str | None = None) -> 
     return item
 
 
+def get_model_item(path: str, base_url: str | None = None) -> dict | None:
+    """Одна модель в том же формате, что и элементы выдачи каталога."""
+    row = db.get_assets_bulk([path]).get(path)
+    if row is None:
+        return None
+    tags = db.get_tags_bulk([path]).get(path, [])
+    collections = db.collections_for_paths([path]).get(path)
+    return build_item(row, tags, base_url, collections)
+
+
 def search_model_items(
     *,
     limit: int = 60,
@@ -189,13 +206,18 @@ def search_model_items(
 ) -> dict:
     """Постраничная выдача каталога: фильтрация и счёт идут в БД, не в Python."""
     rows, total = db.search_assets(limit=limit, offset=offset, sort=sort, **filters)
-    tags_map = db.get_tags_bulk([r["path"] for r in rows])
+    paths = [r["path"] for r in rows]
+    tags_map = db.get_tags_bulk(paths)
+    collections_map = db.collections_for_paths(paths)
     payload = {
         "total": total,
         "limit": limit,
         "offset": offset,
         "sort": sort or "name",
-        "items": [build_item(r, tags_map.get(r["path"], []), base_url) for r in rows],
+        "items": [
+            build_item(r, tags_map.get(r["path"], []), base_url, collections_map.get(r["path"]))
+            for r in rows
+        ],
     }
     if with_facets:
         payload["facets"] = db.facet_counts(**filters)

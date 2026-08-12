@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Админка — каталог моделей</title>
+<link rel="stylesheet" href="/static/styles.css">
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Админка каталога</h1>
+      <p class="meta">Метрики, CRUD тарифов и клиентов, ключи API, загрузка</p>
+    </div>
+    <nav class="admin-nav">
+      <a class="ghost-link" href="/">← К витрине</a>
+      <a class="ghost-link" href="/logout">Выйти</a>
+    </nav>
+  </header>
+
+  <main class="admin-main">
+    <nav class="admin-tabs" id="admin-tabs">
+      <button type="button" class="ghost active" data-tab="metrics">Метрики</button>
+      <button type="button" class="ghost" data-tab="catalog">Каталог</button>
+      <button type="button" class="ghost" data-tab="plans">Тарифы</button>
+      <button type="button" class="ghost" data-tab="customers">Клиенты</button>
+      <button type="button" class="ghost" data-tab="keys">Ключи</button>
+      <button type="button" class="ghost" data-tab="upload">Загрузка</button>
+    </nav>
+
+    <div class="admin-panel" data-panel="metrics">
+      <section class="admin-card">
+        <h2>Метрики API</h2>
+        <p class="hint">Расход за последние 14 дней по ключам <code>/v1</code>. Столбцы — запросы в день.</p>
+        <div class="stat-grid" id="metrics-stats">
+          <div class="stat"><span class="stat-value">…</span><span class="stat-label">загрузка</span></div>
+        </div>
+        <div class="chart" id="metrics-chart"></div>
+      </section>
+      <section class="admin-card">
+        <h2>Топ клиентов и ключей</h2>
+        <div class="split-tables">
+          <table class="keys-table" id="top-customers-table">
+            <thead><tr><th>Клиент</th><th>Запросы</th><th>Скачивания</th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <table class="keys-table" id="top-keys-table">
+            <thead><tr><th>Ключ</th><th>Запросы</th><th>Скачивания</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="admin-card">
+        <h2>Каталог и превью</h2>
+        <div class="stat-grid" id="catalog-metrics"></div>
+        <div class="bar-list" id="category-bars"></div>
+      </section>
+    </div>
+
+    <div class="admin-panel" data-panel="catalog" hidden>
+      <section class="admin-card">
+        <h2>Каталог</h2>
+        <div class="stat-grid" id="stats">
+          <div class="stat"><span class="stat-value">…</span><span class="stat-label">загрузка</span></div>
+        </div>
+      </section>
+      <section class="admin-card">
+        <h2>Управление моделями</h2>
+        <p class="hint">Поиск по имени или пути. Удаление убирает запись из каталога, файлы в хранилище не трогает.</p>
+        <form id="model-search-form" class="key-form form-row">
+          <label>Поиск <input type="search" id="model-q" placeholder="имя или путь"></label>
+          <label>Категория <select id="model-category"><option value="">все</option></select></label>
+          <button type="submit">Найти</button>
+        </form>
+        <div id="models-error" class="result error" hidden></div>
+        <p class="hint" id="models-total"></p>
+        <table class="keys-table" id="models-table">
+          <thead>
+            <tr>
+              <th>Название</th>
+              <th>Категория</th>
+              <th>Формат</th>
+              <th>Размер</th>
+              <th>Превью</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div class="upload-actions">
+          <button type="button" class="ghost" id="models-prev">Назад</button>
+          <button type="button" class="ghost" id="models-next">Дальше</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="admin-panel" data-panel="plans" hidden>
+      <section class="admin-card">
+        <h2>Биллинг</h2>
+        <div class="stat-grid" id="billing-stats">
+          <div class="stat"><span class="stat-value">…</span><span class="stat-label">загрузка</span></div>
+        </div>
+      </section>
+      <section class="admin-card">
+        <h2>Тарифы</h2>
+        <p class="hint">
+          0 в лимитах = без ограничения. Цена — за период (месяц / год / разово).
+          Клик по карточке открывает редактирование. Удалить можно тариф без активных подписок.
+        </p>
+        <div id="plans-grid" class="plans-grid"></div>
+        <form id="plan-form" class="key-form plan-form">
+          <input type="hidden" id="plan-id">
+          <div class="form-grid">
+            <label>Slug <input type="text" id="plan-slug" required placeholder="starter"></label>
+            <label>Название <input type="text" id="plan-name" required placeholder="Starter"></label>
+            <label>Цена, ₽ <input type="number" id="plan-price" min="0" step="1" value="0"></label>
+            <label>Период
+              <select id="plan-period">
+                <option value="month">месяц</option>
+                <option value="year">год</option>
+                <option value="once">разово / бессрочно</option>
+              </select>
+            </label>
+            <label>Запросы / период <input type="number" id="plan-requests" min="0" value="1000"></label>
+            <label>Скачивания / период <input type="number" id="plan-downloads" min="0" value="50"></label>
+            <label>Трафик, ГБ <input type="number" id="plan-gb" min="0" step="0.1" value="0.5"></label>
+            <label>Семантика / период <input type="number" id="plan-searches" min="0" value="0"></label>
+            <label>Лимит / мин <input type="number" id="plan-rpm" min="0" value="60"></label>
+            <label>Макс. ключей <input type="number" id="plan-keys" min="0" value="1"></label>
+            <label>Размер страницы <input type="number" id="plan-page" min="1" max="200" value="24"></label>
+            <label>Пробных дней <input type="number" id="plan-trial" min="0" value="0"></label>
+          </div>
+          <label>Описание <input type="text" id="plan-desc" placeholder="Коротко, для чего тариф"></label>
+          <fieldset class="key-scopes">
+            <legend>Права тарифа</legend>
+            <label><input type="checkbox" name="plan-scope" value="catalog" checked> catalog</label>
+            <label><input type="checkbox" name="plan-scope" value="download" checked> download</label>
+            <label><input type="checkbox" name="plan-scope" value="search"> search</label>
+          </fieldset>
+          <label class="inline-check"><input type="checkbox" id="plan-active" checked> тариф активен</label>
+          <div class="upload-actions">
+            <button type="submit" id="plan-save">Сохранить тариф</button>
+            <button type="button" class="ghost" id="plan-reset">Новый тариф</button>
+            <button type="button" class="ghost" id="plan-delete" hidden>Удалить</button>
+          </div>
+        </form>
+        <div id="plans-error" class="result error" hidden></div>
+      </section>
+    </div>
+
+    <div class="admin-panel" data-panel="customers" hidden>
+      <section class="admin-card">
+        <h2>Клиенты и подписки</h2>
+        <form id="customer-form" class="key-form form-row">
+          <input type="hidden" id="cust-id">
+          <label>Имя / компания <input type="text" id="cust-name" required></label>
+          <label>Email <input type="email" id="cust-email"></label>
+          <label>Заметка <input type="text" id="cust-notes"></label>
+          <button type="submit" id="cust-save">Добавить клиента</button>
+          <button type="button" class="ghost" id="cust-reset" hidden>Сброс</button>
+        </form>
+        <form id="subscribe-form" class="key-form form-row">
+          <label>Клиент <select id="sub-customer"></select></label>
+          <label>Тариф <select id="sub-plan"></select></label>
+          <label class="inline-check"><input type="checkbox" id="sub-paid" checked> счёт оплачен</label>
+          <label class="inline-check"><input type="checkbox" id="sub-trial" checked> пробный период, если есть</label>
+          <label class="inline-check"><input type="checkbox" id="sub-renew" checked> автопродление</label>
+          <button type="submit">Назначить тариф</button>
+        </form>
+        <div id="customers-error" class="result error" hidden></div>
+        <table class="keys-table" id="customers-table">
+          <thead>
+            <tr>
+              <th>Клиент</th>
+              <th>Тариф</th>
+              <th>Статус</th>
+              <th>Период</th>
+              <th>Расход</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+      <section class="admin-card">
+        <h2>Счета</h2>
+        <p class="hint" id="yookassa-hint">
+          «Оплачен» — ручное закрытие. «ЮKassa» создаёт платёж и ссылку для клиента.
+          Webhook: <code>/api/billing/yookassa/webhook</code>
+        </p>
+        <table class="keys-table" id="invoices-table">
+          <thead>
+            <tr>
+              <th>Дата</th>
+              <th>Клиент</th>
+              <th>Тариф</th>
+              <th>Сумма</th>
+              <th>Статус</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </div>
+
+    <div class="admin-panel" data-panel="keys" hidden>
+      <section class="admin-card">
+        <h2>Ключи API выдачи моделей</h2>
+        <p class="hint">
+          Внешние клиенты запрашивают модели через <code>/v1</code>.
+          Авторизация: <code>Authorization: Bearer mfk_…</code> или <code>X-API-Key</code>.
+          Полный ключ показывается только при создании.
+        </p>
+        <form id="key-form" class="key-form">
+          <input type="hidden" id="key-id">
+          <label>
+            Клиент
+            <select id="key-customer">
+              <option value="">без биллинга (внутренний ключ)</option>
+            </select>
+          </label>
+          <label>
+            Название
+            <input type="text" id="key-name" maxlength="120" placeholder="Игра / партнёр" required>
+          </label>
+          <fieldset class="key-scopes">
+            <legend>Права</legend>
+            <label><input type="checkbox" name="scope" value="catalog" checked> catalog — поиск и карточки</label>
+            <label><input type="checkbox" name="scope" value="download" checked> download — скачивание файлов</label>
+            <label><input type="checkbox" name="scope" value="search" checked> search — семантический поиск</label>
+          </fieldset>
+          <label>
+            Лимит / мин
+            <input type="number" id="key-limit" min="0" max="10000" value="120">
+          </label>
+          <div class="upload-actions">
+            <button type="submit" id="key-save">Создать ключ</button>
+            <button type="button" class="ghost" id="key-reset" hidden>Новый ключ</button>
+          </div>
+        </form>
+        <div id="new-key" class="result ok" hidden></div>
+        <div id="keys-error" class="result error" hidden></div>
+        <table class="keys-table" id="keys-table">
+          <thead>
+            <tr>
+              <th>Клиент</th>
+              <th>Название</th>
+              <th>Ключ</th>
+              <th>Права</th>
+              <th>Запросы</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </div>
+
+    <div class="admin-panel" data-panel="upload" hidden>
+      <section class="admin-card">
+        <h2>Ручная загрузка моделей</h2>
+        <p class="hint">
+          Загрузите <b>папку модели</b> или <b>zip-архив</b>. В папке должны лежать сама
+          модель (<code>.glb .gltf .fbx .obj .stl .usdz</code>) и картинка-превью
+          <b>с тем же именем</b> — иначе модель будет пропущена. Текстуры и
+          <code>.bin</code> заливаются вместе с моделью.
+        </p>
+        <div class="upload-row">
+          <label for="category">Категория</label>
+          <select id="category"></select>
+        </div>
+        <div id="dropzone" class="dropzone">
+          <p class="dropzone-title">Перетащите сюда папку или архив</p>
+          <p class="dropzone-sub">или выберите вручную</p>
+          <div class="dropzone-buttons">
+            <button type="button" class="ghost" id="pick-folder">Выбрать папку</button>
+            <button type="button" class="ghost" id="pick-archive">Выбрать архив (.zip)</button>
+          </div>
+          <input type="file" id="input-folder" webkitdirectory directory multiple hidden />
+          <input type="file" id="input-archive" accept=".zip" multiple hidden />
+        </div>
+        <div id="selected" class="selected" hidden></div>
+        <div class="upload-actions">
+          <button type="button" id="do-upload" disabled>Загрузить в каталог</button>
+          <button type="button" class="ghost" id="clear-selection" hidden>Очистить</button>
+        </div>
+        <div class="progress-wrap" id="progress-wrap" hidden>
+          <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+          <span class="progress-text" id="progress-text">0%</span>
+        </div>
+        <div id="result" class="result" hidden></div>
+      </section>
+    </div>
+  </main>
+
+  <script src="/static/admin.js" type="module"></script>
+</body>
+</html>

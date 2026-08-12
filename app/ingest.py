@@ -39,6 +39,7 @@ from app.paths import (
     INGEST_IMAGE_EXTENSIONS,
     INGEST_MAX_FILE_MB,
     INGEST_ROOT,
+    INGEST_PREVIEW_MATCH,
     INGEST_WORKERS,
     MODEL_EXTENSIONS,
     PREVIEW_PIXEL_SIZE,
@@ -52,6 +53,58 @@ log = logging.getLogger("ingest")
 # (URL сохраняем отдельным полем в БД).
 _SKIP_NAMES = {"thumbs.db", ".ds_store", "desktop.ini"}
 _SKIP_SUFFIXES = {".url", ".lnk"}
+
+
+class Progress:
+    """Индикатор долгих проходов: проценты, счётчик и оценка остатка.
+
+    Заливка и очистка идут по тысячам папок часами. Без такого вывода в логе
+    тишина, и невозможно отличить работу от зависания.
+    """
+
+    def __init__(self, total: int, label: str, *, every: int = 25):
+        self.total = max(0, total)
+        self.label = label
+        self.every = max(1, every)
+        self.done = 0
+        self.bytes = 0
+        self.started = time.monotonic()
+
+    def step(self, *, size: int = 0, force: bool = False) -> None:
+        self.done += 1
+        self.bytes += size
+        if not force and self.done % self.every and self.done != self.total:
+            return
+        self.report()
+
+    def report(self) -> None:
+        elapsed = time.monotonic() - self.started
+        pct = (self.done / self.total * 100) if self.total else 0.0
+        rate = self.done / elapsed if elapsed > 0 else 0
+        remaining = (self.total - self.done) / rate if rate > 0 else 0
+        bar_len = 24
+        filled = int(bar_len * pct / 100)
+        bar = "#" * filled + "." * (bar_len - filled)
+        log.info(
+            "%s [%s] %5.1f%%  %d/%d  %.1f ГБ  осталось ~%s",
+            self.label,
+            bar,
+            pct,
+            self.done,
+            self.total,
+            self.bytes / 1e9,
+            _fmt_eta(remaining),
+        )
+
+
+def _fmt_eta(seconds: float) -> str:
+    if seconds <= 0:
+        return "—"
+    if seconds < 60:
+        return f"{int(seconds)} с"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} мин"
+    return f"{seconds / 3600:.1f} ч"
 
 
 @dataclass
@@ -116,8 +169,42 @@ def _read_source_url(dir_path: Path, stem: str) -> str | None:
     return None
 
 
-def iter_candidates(root: Path) -> list[ModelCandidate]:
-    """Папки, где есть модель и одноимённое превью. Остальные пропускаются."""
+# Имена, которыми обычно называют превью, когда оно не совпадает с именем модели.
+_PREVIEW_HINTS = ("preview", "thumb", "thumbnail", "render", "screenshot", "cover", "icon")
+
+
+def _pick_preview(stem: str, images: dict[str, Path], model_count: int) -> Path | None:
+    """Подбирает превью, когда одноимённой картинки нет.
+
+    Осторожно с папками, где несколько моделей: приписать всем одну картинку —
+    значит испортить и выдачу, и AI-классификацию, которая смотрит именно на неё.
+    Поэтому там берём только картинку, чьё имя явно связано с именем модели.
+    """
+    if not images:
+        return None
+    low = {name.lower(): path for name, path in images.items()}
+    target = stem.lower()
+
+    # Имя картинки содержит имя модели или наоборот — связь однозначная.
+    related = [p for name, p in low.items() if target in name or name in target]
+    if related:
+        return sorted(related)[0]
+
+    if model_count > 1:
+        return None  # несколько моделей и ни одной явной пары — не гадаем
+
+    hinted = [p for name, p in low.items() if any(h in name for h in _PREVIEW_HINTS)]
+    if hinted:
+        return sorted(hinted)[0]
+
+    # Единственная модель в папке: самая крупная картинка — почти всегда рендер,
+    # а не иконка материала или логотип автора.
+    return max(images.values(), key=lambda p: p.stat().st_size)
+
+
+def iter_candidates(root: Path, *, preview_match: str | None = None) -> list[ModelCandidate]:
+    """Модели, для которых нашлось превью. Остальные пропускаются."""
+    preview_match = (preview_match or INGEST_PREVIEW_MATCH).lower()
     root = root.resolve()
     found: list[ModelCandidate] = []
     for dirpath, _dirnames, filenames in os.walk(root):
@@ -135,8 +222,10 @@ def iter_candidates(root: Path) -> list[ModelCandidate]:
         for model_name in sorted(models):
             stem = Path(model_name).stem
             preview = images.get(stem)
+            if preview is None and preview_match == "any":
+                preview = _pick_preview(stem, images, len(models))
             if preview is None:
-                continue  # нет одноимённого превью — по условию пропускаем
+                continue  # превью не нашли — модель в каталог не берём
             if cached_files is None:
                 cached_files = _dir_files(dir_path)
             found.append(
@@ -221,7 +310,13 @@ def _upload_dir(candidate: ModelCandidate, *, workers: int) -> tuple[int, int, l
     return uploaded, total_bytes, errors
 
 
-def _asset_values(candidate: ModelCandidate, *, content_hash: str, now: float) -> dict:
+def _asset_values(
+    candidate: ModelCandidate,
+    *,
+    content_hash: str,
+    now: float,
+    record_local_dir: bool = True,
+) -> dict:
     stat = candidate.model_file.stat()
     meta = extract_metadata(candidate.model_file)
     bbox = meta.get("bbox") or [None, None, None]
@@ -251,7 +346,10 @@ def _asset_values(candidate: ModelCandidate, *, content_hash: str, now: float) -
         "category": candidate.category,
         "collection": candidate.collection,
         "dir_key": candidate.dir_key,
-        "local_dir": str(candidate.dir_path),
+        # При ручной загрузке исходник лежит во временной папке, которая тут же
+        # удаляется — записывать её как «оригинал на диске» нельзя, иначе purge
+        # будет считать её пропавшей.
+        "local_dir": str(candidate.dir_path) if record_local_dir else None,
         "source_url": _read_source_url(candidate.dir_path, candidate.model_file.stem),
         "preview_file": preview_basename if ok else None,
         "preview_key": preview_key,
@@ -281,8 +379,10 @@ def run_upload(
     force: bool,
     shard: int = 0,
     shards: int = 1,
+    record_local_dir: bool = True,
+    preview_match: str | None = None,
 ) -> dict:
-    candidates = iter_candidates(root)
+    candidates = iter_candidates(root, preview_match=preview_match)
     total_found = len(candidates)
     if shards > 1:
         # Делим детерминированно по индексу в отсортированном списке: каждый
@@ -311,10 +411,13 @@ def run_upload(
     }
     errors: list[str] = []
     seen_hashes: set[str] = set()
+    planned = len(candidates) if limit is None else min(limit, len(candidates))
+    progress = Progress(planned, "Заливка", every=10)
 
     for candidate in candidates:
         if limit is not None and stats["uploaded"] >= limit:
             break
+        before = stats["bytes"]
         try:
             _process_candidate(
                 candidate,
@@ -326,6 +429,7 @@ def run_upload(
                 dry_run=dry_run,
                 force=force,
                 limit=limit,
+                record_local_dir=record_local_dir,
             )
         except Exception as e:  # noqa: BLE001
             # Обрыв сети до S3 или битый файл не должны обнулять многочасовой
@@ -333,7 +437,9 @@ def run_upload(
             stats["failed"] += 1
             errors.append(f"{candidate.key}: {e}")
             log.warning("Skipping %s after error: %s", candidate.key, e)
+        progress.step(size=stats["bytes"] - before)
 
+    progress.report()
     stats["errors"] = errors[:50]
     return stats
 
@@ -349,6 +455,7 @@ def _process_candidate(
     dry_run: bool,
     force: bool,
     limit: int | None,
+    record_local_dir: bool = True,
 ) -> None:
     """Заливает одну модель. Исключения ловит вызывающий и продолжает обход."""
     key = candidate.key
@@ -397,7 +504,9 @@ def _process_candidate(
         return
 
     now = time.time()
-    values = _asset_values(candidate, content_hash=content_hash, now=now)
+    values = _asset_values(
+        candidate, content_hash=content_hash, now=now, record_local_dir=record_local_dir
+    )
     with db.write_transaction() as conn:
         db.upsert_ingested_asset(conn, key, values, now)
 
@@ -418,6 +527,31 @@ def _process_candidate(
 # --------------------------------------------------------------------------- #
 # Сверка и удаление с диска
 # --------------------------------------------------------------------------- #
+def _verify_dir_against_index(
+    local_dir: Path, dir_key: str, index: dict[str, int]
+) -> tuple[bool, list[str]]:
+    """То же, что _verify_dir, но по заранее собранному списку хранилища.
+
+    Ради скорости: на тысячах папок поштучные HEAD-запросы дают часы работы,
+    здесь же всё сводится к сравнению со словарём в памяти. Гарантия та же —
+    каждый локальный файл обязан лежать в хранилище с тем же размером.
+    """
+    problems: list[str] = []
+    if not local_dir.is_dir():
+        return False, [f"{local_dir}: папки уже нет на диске"]
+    for local in _dir_files(local_dir):
+        rel = PurePosixPath(local.relative_to(local_dir).as_posix())
+        key = str(PurePosixPath(dir_key) / rel)
+        remote_size = index.get(key)
+        if remote_size is None:
+            problems.append(f"{key}: нет в хранилище")
+        elif remote_size != local.stat().st_size:
+            problems.append(f"{key}: размер {remote_size} ≠ {local.stat().st_size}")
+        if len(problems) >= 10:
+            break
+    return not problems, problems
+
+
 def _verify_dir(local_dir: Path, dir_key: str) -> tuple[bool, list[str]]:
     """Все ли файлы папки лежат в хранилище с тем же размером."""
     problems: list[str] = []
@@ -451,33 +585,53 @@ def run_verify(limit: int | None) -> dict:
     ok = 0
     bad: list[str] = []
     dirs = _ingested_dirs(limit)
+    progress = Progress(len(dirs), "Сверка с хранилищем")
     for local_dir, dir_key in dirs:
         good, problems = _verify_dir(Path(local_dir), dir_key)
         if good:
             ok += 1
         else:
             bad.extend(problems[:3])
+        progress.step()
     return {"dirs": len(dirs), "verified": ok, "problems": bad[:50]}
 
 
 def run_purge(limit: int | None, *, confirmed: bool, trash: Path | None) -> dict:
     """Удаляет (или переносит в корзину) папки, полностью подтверждённые в хранилище."""
     dirs = _ingested_dirs(limit)
-    stats = {"dirs": len(dirs), "removed": 0, "kept": 0, "freed_bytes": 0}
+    stats = {
+        "dirs": len(dirs),
+        "removed": 0,
+        "kept": 0,
+        "already_gone": 0,
+        "freed_bytes": 0,
+    }
     problems: list[str] = []
+    progress = Progress(len(dirs), "Очистка диска")
+
+    log.info("Читаю список хранилища для сверки…")
+    index = storage.index_objects()
+    log.info("В хранилище %d объектов, начинаю очистку", len(index))
 
     for local_dir, dir_key in dirs:
         path = Path(local_dir)
-        good, dir_problems = _verify_dir(path, dir_key)
+        if not path.exists():
+            # Папку уже удалили прошлым запуском — это норма, а не проблема.
+            stats["already_gone"] += 1
+            progress.step()
+            continue
+        good, dir_problems = _verify_dir_against_index(path, dir_key, index)
         if not good:
             stats["kept"] += 1
             problems.extend(dir_problems[:2])
+            progress.step()
             continue
         size = sum(f.stat().st_size for f in _dir_files(path))
         if not confirmed:
             log.info("[dry-run] удалить %s (%.1f MB)", path, size / 1e6)
             stats["removed"] += 1
             stats["freed_bytes"] += size
+            progress.step(size=size)
             continue
         try:
             if trash is not None:
@@ -489,9 +643,11 @@ def run_purge(limit: int | None, *, confirmed: bool, trash: Path | None) -> dict
         except OSError as e:
             stats["kept"] += 1
             problems.append(f"{path}: {e}")
+            progress.step()
             continue
         stats["removed"] += 1
         stats["freed_bytes"] += size
+        progress.step(size=size)
 
     stats["problems"] = problems[:50]
     return stats
@@ -508,6 +664,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--root", type=Path, default=INGEST_ROOT, help="корень каталога на диске")
     p.add_argument("--limit", type=int, default=None, help="максимум моделей за запуск")
     p.add_argument("--workers", type=int, default=INGEST_WORKERS, help="параллельных заливок")
+    p.add_argument(
+        "--preview-match",
+        choices=("strict", "any"),
+        default=INGEST_PREVIEW_MATCH,
+        help="strict — только одноимённое превью; any — подобрать картинку из папки",
+    )
     p.add_argument(
         "--shards", type=int, default=1,
         help="на сколько частей разделить каталог (для нескольких процессов)",
@@ -553,7 +715,7 @@ def main(argv: list[str] | None = None) -> int:
     db.init_db()
 
     if args.command == "scan":
-        candidates = iter_candidates(root)
+        candidates = iter_candidates(root, preview_match=args.preview_match)
         by_category: dict[str, int] = {}
         total_bytes = 0
         for c in candidates:
@@ -578,6 +740,7 @@ def main(argv: list[str] | None = None) -> int:
             force=args.force,
             shard=args.shard,
             shards=args.shards,
+            preview_match=args.preview_match,
         )
         print(json.dumps(stats, ensure_ascii=False, indent=2))
         return 0 if not stats.get("failed") else 1

@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__ — оплата</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: radial-gradient(1200px 600px at 50% -10%, #1d2740 0%, #0e1117 60%);
+    color: #e6e9ef; padding: 24px;
+  }
+  .card {
+    width: 100%; max-width: 420px; background: #161b25; padding: 32px;
+    border: 1px solid #262d3a; border-radius: 14px;
+    box-shadow: 0 20px 50px rgba(0,0,0,.45);
+  }
+  .card.ok { border-color: #2f6f4a; }
+  .card.err { border-color: #6f2f2f; }
+  h1 { margin: 0 0 8px; font-size: 20px; }
+  .lead { margin: 0 0 20px; color: #8b95a7; font-size: 14px; }
+  .amount { margin: 0 0 6px; font-size: 28px; font-weight: 650; letter-spacing: -0.03em; }
+  .meta { margin: 0 0 24px; color: #b6bfcf; font-size: 13px; }
+  .amount:empty, .meta:empty, .note:empty { display: none; }
+  button {
+    width: 100%; padding: 11px; font-size: 15px; font-weight: 600; cursor: pointer;
+    background: #4b7bec; color: #fff; border: 0; border-radius: 8px;
+  }
+  button:hover { background: #3d6ad9; }
+  .note { margin: 16px 0 0; color: #8b95a7; font-size: 12px; }
+</style>
+</head>
+<body>
+  <div class="card __STATE__">
+    <h1>__TITLE__</h1>
+    <p class="lead">__LEAD__</p>
+    <p class="amount">__AMOUNT__</p>
+    <p class="meta">__META__</p>
+    __ACTION__
+    <p class="note">__NOTE__</p>
+  </div>
+</body>
+</html>

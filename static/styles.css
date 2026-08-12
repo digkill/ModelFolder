@@ -230,6 +230,118 @@ main {
   color: #f28b82;
 }
 
+/* --- оценка, подборки и режим поиска --- */
+
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.filter-select {
+  padding: 0.4rem 0.5rem;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.85rem;
+}
+
+.card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+}
+
+.stars {
+  display: inline-flex;
+  gap: 0.1rem;
+}
+.star {
+  background: none;
+  border: 0;
+  padding: 0 1px;
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  color: #4a5160;
+  transition: color 0.12s, transform 0.12s;
+}
+.star:hover { transform: scale(1.18); }
+.star.on { color: #f5b544; }
+
+/* Кнопка подборок и её выпадающее меню. */
+.collect-wrap { position: relative; }
+.collect-btn {
+  background: none;
+  border: 0;
+  cursor: pointer;
+  font-size: 1.05rem;
+  line-height: 1;
+  color: #4a5160;
+  padding: 0 2px;
+  transition: color 0.12s, transform 0.12s;
+}
+.collect-btn:hover { transform: scale(1.15); }
+.collect-btn.active { color: #ec4b6c; }
+
+.collection-menu {
+  position: absolute;
+  right: 0;
+  bottom: 130%;
+  z-index: 30;
+  min-width: 190px;
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 0.5rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+}
+.collection-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.3rem 0.25rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.collection-row:hover { background: rgba(255, 255, 255, 0.05); }
+
+.collection-new {
+  display: flex;
+  gap: 0.3rem;
+  margin-top: 0.4rem;
+  padding-top: 0.4rem;
+  border-top: 1px solid var(--border);
+}
+.collection-new input {
+  flex: 1;
+  min-width: 0;
+  padding: 0.3rem 0.4rem;
+  font-size: 0.82rem;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.collection-new button {
+  padding: 0.3rem 0.6rem;
+  border-radius: 6px;
+  border: 0;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+
 /* Маркер конца списка — он же индикатор подгрузки следующей страницы. */
 .scroll-sentinel {
   padding: 1.5rem;

@@ -289,6 +289,33 @@ def object_exists(key: str) -> bool:
     return _local_resolve(key).is_file()
 
 
+def index_objects(prefix: str = "") -> dict[str, int]:
+    """Все ключи хранилища с размерами одним махом: key -> size.
+
+    Поштучный head_object на десятки тысяч файлов превращает сверку в часы.
+    Один листинг отдаёт по 1000 объектов за запрос, после чего проверка
+    становится обычным поиском по словарю в памяти.
+    """
+    out: dict[str, int] = {}
+    if is_s3():
+        client = _s3()
+        full_prefix = _s3_full_key(prefix) if prefix else (S3_PREFIX or "")
+        kwargs = {"Bucket": S3_BUCKET}
+        if full_prefix:
+            kwargs["Prefix"] = full_prefix
+        for page in client.get_paginator("list_objects_v2").paginate(**kwargs):
+            for obj in page.get("Contents", []):
+                full_key = obj["Key"]
+                if full_key.endswith("/"):
+                    continue
+                out[_s3_strip_prefix(full_key)] = int(obj["Size"])
+        return out
+    for rel, size, _mtime in _local_iter_objects():
+        if not prefix or rel.startswith(prefix):
+            out[rel] = size
+    return out
+
+
 def stat_object(key: str) -> tuple[int, float] | None:
     """(size, mtime) объекта или None, если его нет."""
     try:

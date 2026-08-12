@@ -31,6 +31,8 @@ COOKIE_NAME = "mf_session"
 
 # Пути, доступные без авторизации: сама форма входа и health-check (по нему
 # docker/traefik определяют живость контейнера — он не должен требовать логина).
+# Оплата ЮKassa тоже публичная: webhook приходит с их серверов, а /pay —
+# страница, которую открывает клиент по ссылке из письма.
 PUBLIC_PATHS = frozenset({"/login", "/logout", "/api/health", "/favicon.ico"})
 
 
@@ -117,7 +119,18 @@ def authenticated_user(request) -> str | None:
 
 
 def is_public_path(path: str) -> bool:
-    return path in PUBLIC_PATHS
+    if path in PUBLIC_PATHS:
+        return True
+    if path == "/pay" or path.startswith("/pay/"):
+        return True
+    if path == "/api/billing/yookassa/webhook":
+        return True
+    return False
+
+
+def is_service_path(path: str) -> bool:
+    """Сервисный API выдачи моделей: ключ Bearer, не логин витрины."""
+    return path == "/v1" or path.startswith("/v1/")
 
 
 def set_session_cookie(response, username: str, *, secure: bool) -> None:
