@@ -35,8 +35,8 @@ def _forward_headers(request: Request) -> dict[str, str]:
     return {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP}
 
 
-async def _proxy(request: Request, url: str) -> StreamingResponse:
-    timeout = httpx.Timeout(None, connect=10.0)
+async def _proxy(request: Request, url: str, *, stream_forever: bool = False) -> StreamingResponse:
+    timeout = httpx.Timeout(None if stream_forever else 30.0, connect=5.0)
     client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
     try:
         body = await request.body()
@@ -74,7 +74,11 @@ async def studio_api(path: str, request: Request):
     if not STUDIO_API_URL:
         raise HTTPException(status_code=404, detail="Studio API is not enabled")
     qs = f"?{request.url.query}" if request.url.query else ""
-    return await _proxy(request, f"{STUDIO_API_URL}/api/{path}{qs}")
+    return await _proxy(
+        request,
+        f"{STUDIO_API_URL}/api/{path}{qs}",
+        stream_forever=path.rstrip("/").endswith("/events"),
+    )
 
 
 @router.api_route("/app", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])

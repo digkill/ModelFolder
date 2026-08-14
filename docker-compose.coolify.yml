@@ -4,6 +4,7 @@
 #   * наружу не публикуется ни один порт — HTTP идёт через coolify-proxy (Traefik)
 #     по домену из SERVICE_FQDN_APP_8000, Postgres и Qdrant доступны только внутри сети;
 #   * лимиты CPU/RAM ужаты под реальный размер сервера;
+#   * воркер обогащения выключен (profile `worker`) — иначе 4 ГБ не хватает;
 #   * каталог моделей берётся из S3 (STORAGE_BACKEND=s3), локальный том не монтируется.
 #
 # Секреты (OPENAI_API_KEY, S3_*, DB_PASSWORD) задаются в Coolify → Environment Variables.
@@ -12,7 +13,7 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
-    mem_limit: 320m
+    mem_limit: 256m
     environment:
       POSTGRES_DB: ${DB_DATABASE:-model_catalog}
       POSTGRES_USER: ${DB_USERNAME:-model_catalog}
@@ -28,7 +29,7 @@ services:
   qdrant:
     image: qdrant/qdrant:latest
     restart: unless-stopped
-    mem_limit: 448m
+    mem_limit: 256m
     volumes:
       - qdrant_storage:/qdrant/storage
     healthcheck:
@@ -40,9 +41,9 @@ services:
   app:
     build: .
     restart: unless-stopped
-    mem_limit: 1200m
-    mem_reservation: 512m
-    cpus: "1.5"
+    mem_limit: 768m
+    mem_reservation: 384m
+    cpus: "1.0"
     depends_on:
       postgres:
         condition: service_healthy
@@ -60,11 +61,10 @@ services:
       - DB_PASSWORD=${DB_PASSWORD:?DB_PASSWORD is required}
       - DATA_DIR=/data/app
       - API_BASE_URL=${SERVICE_FQDN_APP_8000}
-      - RUN_SCANNER=${RUN_SCANNER:-1}
+      - RUN_SCANNER=${RUN_SCANNER:-0}
       - SCAN_INTERVAL_SEC=${SCAN_INTERVAL_SEC:-300}
-      # Рендер превью на 2 ядрах — держим аппетит в рамках лимита контейнера.
-      - PREVIEW_MAX_MEMORY_MB=${PREVIEW_MAX_MEMORY_MB:-768}
-      - PREVIEW_BATCH_PER_CYCLE=${PREVIEW_BATCH_PER_CYCLE:-50}
+      - PREVIEW_MAX_MEMORY_MB=${PREVIEW_MAX_MEMORY_MB:-256}
+      - PREVIEW_BATCH_PER_CYCLE=${PREVIEW_BATCH_PER_CYCLE:-10}
       - STORAGE_BACKEND=${STORAGE_BACKEND:-s3}
       - S3_ENDPOINT_URL=${S3_ENDPOINT_URL}
       - S3_REGION=${S3_REGION}
@@ -86,18 +86,19 @@ services:
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
       interval: 30s
-      timeout: 5s
-      start_period: 60s
-      retries: 5
+      timeout: 10s
+      start_period: 90s
+      retries: 10
 
-  # Воркер обогащения БД: авто-теги (Vision) + AI-описания + эмбеддинги в Qdrant.
+  # Воркер обогащения выключен на 4 ГБ (включается: docker compose --profile worker).
   worker:
+    profiles: ["worker"]
     build: .
     restart: unless-stopped
     command: ["python", "-m", "app.worker"]
-    mem_limit: 768m
-    mem_reservation: 256m
-    cpus: "1.0"
+    mem_limit: 384m
+    mem_reservation: 128m
+    cpus: "0.5"
     depends_on:
       postgres:
         condition: service_healthy
@@ -138,7 +139,7 @@ services:
   studio-db:
     image: postgres:16-alpine
     restart: unless-stopped
-    mem_limit: 160m
+    mem_limit: 96m
     environment:
       POSTGRES_DB: studio
       POSTGRES_USER: studio
@@ -154,9 +155,9 @@ services:
   studio-api:
     build: ./studio/backend
     restart: unless-stopped
-    mem_limit: 384m
-    mem_reservation: 128m
-    cpus: "0.5"
+    mem_limit: 192m
+    mem_reservation: 64m
+    cpus: "0.25"
     environment:
       STUDIO_ADDR: :8080
       STUDIO_DATABASE_URL: postgres://studio:${STUDIO_DB_PASSWORD:-studio}@studio-db:5432/studio?sslmode=disable
@@ -184,7 +185,7 @@ services:
   studio-web:
     build: ./studio/web
     restart: unless-stopped
-    mem_limit: 64m
+    mem_limit: 48m
     depends_on:
       - studio-api
 
