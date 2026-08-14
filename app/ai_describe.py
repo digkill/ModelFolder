@@ -289,7 +289,7 @@ def similar_to_path(path: str, *, limit: int = 12) -> dict:
 
 
 def cut_by_relevance(
-    hits: list[dict], *, ratio: float = 0.93, keep_at_least: int = 12
+    hits: list[dict], *, ratio: float = 0.85, keep_at_least: int = 12
 ) -> list[dict]:
     """Отсекает «хвост» выдачи Qdrant относительно лучшего совпадения.
 
@@ -297,6 +297,9 @@ def cut_by_relevance(
     оценки низкие (0.29–0.37), а у длинного — высокие, и одно и то же число
     либо режет всё, либо не режет ничего. Поэтому смотрим на просадку
     относительно первого результата — она устойчива к языку и длине запроса.
+
+    `keep_at_least` не должен быть меньше запрошенного `limit`: иначе каталог
+    схлопывается до дефолтных 12, а прокрутка думает, что выдача кончилась.
     """
     if not hits:
         return hits
@@ -305,7 +308,8 @@ def cut_by_relevance(
         return hits
     threshold = top * ratio
     kept = [h for h in hits if (h.get("score") or 0) >= threshold]
-    return kept if len(kept) >= keep_at_least else hits[:keep_at_least]
+    floor = min(len(hits), max(1, keep_at_least))
+    return kept if len(kept) >= floor else hits[:floor]
 
 
 def semantic_search(
@@ -314,7 +318,7 @@ def semantic_search(
     limit: int = 12,
     filters: dict | None = None,
     score_threshold: float | None = None,
-    relevance_ratio: float | None = 0.93,
+    relevance_ratio: float | None = 0.85,
 ) -> dict:
     """Поиск моделей по свободному запросу с фильтрами по категории/тегам/рейтингу."""
     if not OPENAI_API_KEY:
@@ -332,7 +336,7 @@ def semantic_search(
         score_threshold=score_threshold,
     )
     if relevance_ratio:
-        hits = cut_by_relevance(hits, ratio=relevance_ratio)
+        hits = cut_by_relevance(hits, ratio=relevance_ratio, keep_at_least=limit)
     return {
         "ok": True,
         "query": {"text": q, "filters": filters or {}},

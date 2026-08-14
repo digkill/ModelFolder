@@ -79,6 +79,8 @@ services:
       - OPENAI_TAG_MODEL=${OPENAI_TAG_MODEL:-gpt-4o-mini}
       - OPENAI_DESCRIBE_MODEL=${OPENAI_DESCRIBE_MODEL:-gpt-4o-mini}
       - OPENAI_EMBED_MODEL=${OPENAI_EMBED_MODEL:-text-embedding-3-small}
+      - STUDIO_WEB_URL=http://studio-web:80
+      - STUDIO_API_URL=http://studio-api:8080
     volumes:
       - app_data:/data/app
     healthcheck:
@@ -133,7 +135,61 @@ services:
     volumes:
       - app_data:/data/app
 
+  studio-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    mem_limit: 160m
+    environment:
+      POSTGRES_DB: studio
+      POSTGRES_USER: studio
+      POSTGRES_PASSWORD: ${STUDIO_DB_PASSWORD:-studio}
+    volumes:
+      - studio_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U studio -d studio"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  studio-api:
+    build: ./studio/backend
+    restart: unless-stopped
+    mem_limit: 384m
+    mem_reservation: 128m
+    cpus: "0.5"
+    environment:
+      STUDIO_ADDR: :8080
+      STUDIO_DATABASE_URL: postgres://studio:${STUDIO_DB_PASSWORD:-studio}@studio-db:5432/studio?sslmode=disable
+      CATALOG_URL: http://app:8000
+      AUTH_USERNAME: ${AUTH_USERNAME:-}
+      AUTH_PASSWORD: ${AUTH_PASSWORD:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GROK_API_KEY: ${GROK_API_KEY:-}
+      KIE_API_KEY: ${KIE_API_KEY:-}
+      MESHY_API_KEY: ${MESHY_API_KEY:-}
+      STUDIO_ORCHESTRATOR: ${STUDIO_ORCHESTRATOR:-auto}
+    depends_on:
+      studio-db:
+        condition: service_healthy
+      app:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/v1/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+
+  studio-web:
+    build: ./studio/web
+    restart: unless-stopped
+    mem_limit: 64m
+    depends_on:
+      - studio-api
+
 volumes:
   postgres_data:
   qdrant_storage:
   app_data:
+  studio_pg:

@@ -165,6 +165,7 @@ def _run_search(body: SearchBody, base_url: str | None) -> dict:
         semantic = ai_describe.semantic_search(
             query,
             limit=SEMANTIC_CANDIDATES,
+            relevance_ratio=None,
             filters={
                 "categories": filters["categories"],
                 "tags_any": filters["tags_any"],

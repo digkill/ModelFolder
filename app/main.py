@@ -23,6 +23,7 @@ from app import admin, ai_describe, api_keys, auth, storage, vector_store
 from app.launch_groups import GroupFilters, get_launch_group, list_launch_groups
 from app.model_catalog import filters_from_query, list_model_items, search_model_items
 from app.service_api import router as service_router
+from app.studio_proxy import router as studio_proxy_router
 from app.yookassa import router as yookassa_router
 from app.paths import (
     API_BASE_URL,
@@ -67,7 +68,7 @@ class AppendTagsBody(BaseModel):
 
 class SemanticSearchBody(BaseModel):
     query: str = Field(..., description="Запрос на естественном языке")
-    limit: int = Field(12, ge=1, le=50)
+    limit: int = Field(60, ge=1, le=300)
     category: list[str] = Field(default_factory=list, description="Категории каталога")
     tags: list[str] = Field(default_factory=list, description="Хотя бы один тег")
     tags_all: list[str] = Field(default_factory=list, description="Все перечисленные теги")
@@ -349,6 +350,7 @@ def logout():
 app.include_router(admin.router)
 app.include_router(service_router)
 app.include_router(yookassa_router)
+app.include_router(studio_proxy_router)
 
 if static_dir.is_dir():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
@@ -664,7 +666,10 @@ def catalog_search(
             # Пул кандидатов фиксированный, а не от размера страницы: иначе на
             # первой странице Qdrant отдаёт единицы, счётчик «найдено» врёт,
             # а прокрутка упирается в конец выдачи.
+            # Отсечение по score здесь не режем: Qdrant уже ранжирует, а
+            # relevance_ratio с keep_at_least=12 оставлял ровно 12 моделей.
             limit=SEMANTIC_CANDIDATES,
+            relevance_ratio=None,
             filters={
                 "categories": filters["categories"],
                 "tags_any": filters["tags_any"],

@@ -1,0 +1,43 @@
+services:
+  studio-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: studio
+      POSTGRES_USER: studio
+      POSTGRES_PASSWORD: ${STUDIO_DB_PASSWORD:-studio}
+    ports:
+      - "${STUDIO_DB_PORT:-15433}:5432"
+    volumes:
+      - studio_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U studio -d studio"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  studio-api:
+    build: ./backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      STUDIO_ADDR: :8080
+      STUDIO_DATABASE_URL: postgres://studio:${STUDIO_DB_PASSWORD:-studio}@studio-db:5432/studio?sslmode=disable
+      CATALOG_URL: ${CATALOG_URL:-http://host.docker.internal:18080}
+    ports:
+      - "${STUDIO_API_PORT:-18082}:8080"
+    depends_on:
+      studio-db:
+        condition: service_healthy
+
+  studio-web:
+    build: ./web
+    restart: unless-stopped
+    ports:
+      - "${STUDIO_WEB_PORT:-18081}:80"
+    depends_on:
+      - studio-api
+
+volumes:
+  studio_pg:

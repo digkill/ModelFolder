@@ -57,6 +57,8 @@ services:
       API_BASE_URL: ${API_BASE_URL:-http://127.0.0.1:18080}
       PREVIEW_MAX_MEMORY_MB: ${PREVIEW_MAX_MEMORY_MB:-6144}
       RUN_SCANNER: ${RUN_SCANNER:-1}
+      STUDIO_WEB_URL: http://studio-web:80
+      STUDIO_API_URL: http://studio-api:8080
     volumes:
       - app_data:/data/app
 
@@ -85,7 +87,59 @@ services:
     volumes:
       - app_data:/data/app
 
+  studio-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: studio
+      POSTGRES_USER: studio
+      POSTGRES_PASSWORD: ${STUDIO_DB_PASSWORD:-studio}
+    ports:
+      - "${STUDIO_DB_PORT:-15433}:5432"
+    volumes:
+      - studio_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U studio -d studio"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  studio-api:
+    build: ./studio/backend
+    restart: unless-stopped
+    env_file:
+      - path: ./studio/.env
+        required: false
+    environment:
+      STUDIO_ADDR: :8080
+      STUDIO_DATABASE_URL: postgres://studio:${STUDIO_DB_PASSWORD:-studio}@studio-db:5432/studio?sslmode=disable
+      CATALOG_URL: http://app:8000
+      AUTH_USERNAME: ${AUTH_USERNAME:-}
+      AUTH_PASSWORD: ${AUTH_PASSWORD:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GROK_API_KEY: ${GROK_API_KEY:-}
+      KIE_API_KEY: ${KIE_API_KEY:-}
+      MESHY_API_KEY: ${MESHY_API_KEY:-}
+      STUDIO_ORCHESTRATOR: ${STUDIO_ORCHESTRATOR:-auto}
+    ports:
+      - "${STUDIO_API_PORT:-18082}:8080"
+    depends_on:
+      studio-db:
+        condition: service_healthy
+      app:
+        condition: service_started
+
+  studio-web:
+    build: ./studio/web
+    restart: unless-stopped
+    ports:
+      - "${STUDIO_WEB_PORT:-18081}:80"
+    depends_on:
+      - studio-api
+
 volumes:
   postgres_data:
   qdrant_storage:
   app_data:
+  studio_pg:

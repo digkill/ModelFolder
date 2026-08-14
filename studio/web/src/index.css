@@ -1,0 +1,10 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Sora", "Inter", ui-sans-serif, system-ui, sans-serif;
+  --color-ink: #09090b;
+  --color-accent: #7c5cff;
+}
+
+html, body, #root { height: 100%; }
+body { font-family: var(--font-sans); }

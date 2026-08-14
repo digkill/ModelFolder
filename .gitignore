@@ -8,3 +8,6 @@ __pycache__/
 .idea
 models/*
 data/*
+studio/.env
+studio/web/node_modules/
+studio/web/dist/
