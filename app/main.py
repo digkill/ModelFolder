@@ -23,7 +23,7 @@ from app import admin, ai_describe, api_keys, auth, storage, vector_store
 from app.launch_groups import GroupFilters, get_launch_group, list_launch_groups
 from app.model_catalog import filters_from_query, list_model_items, search_model_items
 from app.service_api import router as service_router
-from app.studio_proxy import mount_studio_ui, router as studio_proxy_router
+from app.studio_proxy import STUDIO_API_URL, mount_studio_ui, router as studio_proxy_router, ui_dir
 from app.yookassa import router as yookassa_router
 from app.paths import (
     API_BASE_URL,
@@ -399,6 +399,8 @@ def health() -> dict:
         "api_base_url": API_BASE_URL,
         "service_api": "/v1",
         "yookassa_configured": bool(YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY),
+        "studio_ui": ui_dir() is not None,
+        "studio_api": bool(STUDIO_API_URL),
     }
 
 

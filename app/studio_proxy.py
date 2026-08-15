@@ -103,27 +103,23 @@ def _safe_file(root: Path, path: str) -> Path | None:
 
 
 def mount_studio_ui(app: FastAPI) -> None:
-    root = ui_dir()
-    if root is None:
-        if STUDIO_WEB_URL:
-            app.include_router(_fallback_web_router())
-        return
-
     @app.get("/app", include_in_schema=False)
     def studio_root():
         return RedirectResponse("/app/", status_code=302)
 
     @app.get("/app/", include_in_schema=False)
-    def studio_index():
-        return FileResponse(root / "index.html")
-
     @app.get("/app/{path:path}", include_in_schema=False)
-    def studio_spa(path: str):
+    def studio_spa(path: str = ""):
         if path.startswith("api/"):
-            raise HTTPException(status_code=404, detail="Not found")
-        found = _safe_file(root, path)
-        if found is not None:
-            return FileResponse(found)
+            raise HTTPException(status_code=404, detail="Not Found")
+        root = ui_dir()
+        if root is None:
+            if STUDIO_WEB_URL:
+                raise HTTPException(status_code=502, detail="Studio UI is not packaged")
+            raise HTTPException(status_code=503, detail="Studio UI is not packaged")
+        target = root / "index.html" if not path else _safe_file(root, path)
+        if target is not None:
+            return FileResponse(target)
         return FileResponse(root / "index.html")
 
 
