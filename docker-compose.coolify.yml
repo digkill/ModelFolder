@@ -79,7 +79,6 @@ services:
       - OPENAI_TAG_MODEL=${OPENAI_TAG_MODEL:-gpt-4o-mini}
       - OPENAI_DESCRIBE_MODEL=${OPENAI_DESCRIBE_MODEL:-gpt-4o-mini}
       - OPENAI_EMBED_MODEL=${OPENAI_EMBED_MODEL:-text-embedding-3-small}
-      - STUDIO_WEB_URL=http://studio-web:80
       - STUDIO_API_URL=http://studio-api:8080
     volumes:
       - app_data:/data/app
@@ -181,13 +180,6 @@ services:
       timeout: 5s
       start_period: 20s
       retries: 5
-
-  studio-web:
-    build: ./studio/web
-    restart: unless-stopped
-    mem_limit: 48m
-    depends_on:
-      - studio-api
 
 volumes:
   postgres_data:

@@ -23,7 +23,7 @@ from app import admin, ai_describe, api_keys, auth, storage, vector_store
 from app.launch_groups import GroupFilters, get_launch_group, list_launch_groups
 from app.model_catalog import filters_from_query, list_model_items, search_model_items
 from app.service_api import router as service_router
-from app.studio_proxy import router as studio_proxy_router
+from app.studio_proxy import mount_studio_ui, router as studio_proxy_router
 from app.yookassa import router as yookassa_router
 from app.paths import (
     API_BASE_URL,
@@ -351,6 +351,7 @@ app.include_router(admin.router)
 app.include_router(service_router)
 app.include_router(yookassa_router)
 app.include_router(studio_proxy_router)
+mount_studio_ui(app)
 
 if static_dir.is_dir():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")

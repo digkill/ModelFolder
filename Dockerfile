@@ -1,3 +1,10 @@
+FROM node:22-bookworm-slim AS studio-ui
+WORKDIR /web
+COPY studio/web/package.json studio/web/package-lock.json ./
+RUN npm ci
+COPY studio/web/ ./
+RUN npm run build
+
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -32,6 +39,7 @@ RUN python -m playwright install --with-deps chromium
 COPY app ./app
 COPY static ./static
 COPY scripts ./scripts
+COPY --from=studio-ui /web/dist /app/static/studio
 
 # Каталог моделей и данные монтируются как volume (см. docker-compose.yml).
 ENV MODELS_DIR=/data/models \
