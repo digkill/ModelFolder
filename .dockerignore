@@ -13,3 +13,5 @@ scratchpad/
 *.md
 .claude/
 .vscode/
+studio/web/node_modules/
+studio/web/dist/

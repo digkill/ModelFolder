@@ -39,11 +39,13 @@ services:
       retries: 5
 
   app:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.web
     restart: unless-stopped
-    mem_limit: 1100m
-    mem_reservation: 512m
-    cpus: "1.0"
+    mem_limit: 768m
+    mem_reservation: 256m
+    cpus: "0.75"
     depends_on:
       postgres:
         condition: service_healthy
