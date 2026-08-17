@@ -47,13 +47,20 @@ function ThreeView({ url }: { url?: string }) {
     tick();
     let root: THREE.Object3D | null = null;
     if (url) {
-      new GLTFLoader().load(url, (gltf) => {
-        root = gltf.scene;
-        scene.add(root);
-        const box = new THREE.Box3().setFromObject(root);
-        const size = box.getSize(new THREE.Vector3()).length() || 1;
-        root.scale.multiplyScalar(2 / size);
-      });
+      const loader = new GLTFLoader();
+      loader.setCrossOrigin("use-credentials");
+      loader.load(
+        url,
+        (gltf) => {
+          root = gltf.scene;
+          scene.add(root);
+          const box = new THREE.Box3().setFromObject(root);
+          const size = box.getSize(new THREE.Vector3()).length() || 1;
+          root.scale.multiplyScalar(2 / size);
+        },
+        undefined,
+        (err) => console.warn("gltf load failed", url, err)
+      );
     }
     return () => {
       cancelAnimationFrame(frame);

@@ -1314,7 +1314,13 @@ def build_asset_filter(
         # NULL = ещё не классифицировано: в безопасном режиме такие не показываем.
         where.append("a.nsfw = 0 AND (a.content_adult IS NULL OR a.content_adult = 0)")
     if only_with_preview:
-        where.append("a.preview_status = 'ok' AND a.preview_file IS NOT NULL")
+        # Должно совпадать с _preview_url(): на S3-бэкенде PNG лежит не файлом
+        # рядом с ingest, а ключом в хранилище. Проверка только по preview_file
+        # выкидывала из выдачи вообще все модели, у которых превью есть.
+        where.append(
+            "((a.preview_status = 'ok' AND a.preview_file IS NOT NULL)"
+            " OR a.preview_key IS NOT NULL)"
+        )
     if animated is not None:
         # Признак берём из метаданных файла (клипы анимации), а не из тегов AI:
         # он точный и есть у модели сразу после заливки.

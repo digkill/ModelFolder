@@ -244,6 +244,33 @@ class Store:
                 )
                 return [_row_job(r) for r in await cur.fetchall()]
 
+    async def replace_assets_of_kind(self, project_id: str, kind: str) -> None:
+        async with self.pool.connection() as conn:
+            await conn.execute(
+                "DELETE FROM assets WHERE project_id = %s AND kind = %s",
+                (project_id, kind),
+            )
+
+    async def delete_assets(self, project_id: str, ids: list[str]) -> int:
+        if not ids:
+            return 0
+        async with self.pool.connection() as conn:
+            await conn.execute(
+                "DELETE FROM assets WHERE project_id = %s AND id = ANY(%s::uuid[])",
+                (project_id, ids),
+            )
+        return len(ids)
+
+    async def update_asset_url(self, asset_id: str, url: str, meta: Any = None) -> None:
+        async with self.pool.connection() as conn:
+            if meta is None:
+                await conn.execute("UPDATE assets SET url = %s WHERE id = %s", (url, asset_id))
+                return
+            await conn.execute(
+                "UPDATE assets SET url = %s, meta_json = %s WHERE id = %s",
+                (url, Json(meta), asset_id),
+            )
+
     async def add_asset(self, **kwargs: Any) -> dict:
         async with self.pool.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:

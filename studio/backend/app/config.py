@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     studio_addr: str = ":8080"
     studio_database_url: str = "postgres://studio:studio@127.0.0.1:15433/studio?sslmode=disable"
     catalog_url: str = "http://127.0.0.1:8000"
+    catalog_public_url: str = ""
     studio_public_url: str = "http://127.0.0.1:18081/app"
     studio_orchestrator: str = "auto"
 
@@ -32,6 +33,8 @@ class Settings(BaseSettings):
     kie_base_url: str = "https://api.kie.ai/api/v1"
     meshy_api_key: str = ""
     meshy_base_url: str = "https://api.meshy.ai/openapi/v2"
+    kie_callback_url: str = "https://modelfolder.mediarise.org/api/webhooks/kie"
+    studio_use_meshy: bool = False
     auth_username: str = ""
     auth_password: str = ""
     catalog_auth_username: str = ""
@@ -52,6 +55,21 @@ class Settings(BaseSettings):
     @property
     def catalog(self) -> str:
         return self.catalog_url.rstrip("/")
+
+    @property
+    def catalog_public(self) -> str:
+        explicit = (self.catalog_public_url or "").rstrip("/")
+        if explicit:
+            return explicit
+        host = (
+            self.catalog.replace("https://", "")
+            .replace("http://", "")
+            .split("/", 1)[0]
+            .split(":", 1)[0]
+        )
+        if host in {"127.0.0.1", "localhost"}:
+            return self.catalog
+        return ""
 
     @property
     def kie_base(self) -> str:

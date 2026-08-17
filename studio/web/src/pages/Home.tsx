@@ -22,7 +22,7 @@ const platforms = [
 
 export default function Home() {
   const nav = useNavigate();
-  const [prompt, setPrompt] = useState("Пиксельный платформер про рыцаря-робота в неоновом замке, с трейлером и голосом рассказчика.");
+  const [prompt, setPrompt] = useState("");
   const [platform, setPlatform] = useState("web");
   const [busy, setBusy] = useState(false);
   const [items, setItems] = useState<Project[]>([]);
@@ -62,7 +62,11 @@ export default function Home() {
           ModelFolder и запускает генерацию картинки, ролика, озвучки и музыки.
         </p>
         <Card className="mt-8 p-5">
-          <Textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} />
+          <Textarea
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            placeholder="Опиши только эту игру: жанр, герой, мир. Каждый проект — отдельный контекст."
+          />
           <div className="mt-4 flex flex-wrap gap-2">
             {platforms.map((p) => (
               <Button
@@ -77,7 +81,7 @@ export default function Home() {
             ))}
           </div>
           {error && <p className="mt-3 text-sm text-red-400">{error}</p>}
-          <Button className="mt-5" size="lg" disabled={busy} onClick={create}>
+          <Button className="mt-5" size="lg" disabled={busy || !prompt.trim()} onClick={create}>
             <Clapperboard className="h-4 w-4" />
             {busy ? "Запускаем пайплайн…" : "Собрать игру"}
           </Button>

@@ -33,7 +33,7 @@ COOKIE_NAME = "mf_session"
 # docker/traefik определяют живость контейнера — он не должен требовать логина).
 # Оплата ЮKassa тоже публичная: webhook приходит с их серверов, а /pay —
 # страница, которую открывает клиент по ссылке из письма.
-PUBLIC_PATHS = frozenset({"/login", "/logout", "/api/health", "/favicon.ico"})
+PUBLIC_PATHS = frozenset({"/login", "/logout", "/api/health", "/favicon.ico", "/api/webhooks/kie"})
 
 
 def is_enabled() -> bool:

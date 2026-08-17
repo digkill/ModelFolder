@@ -376,6 +376,13 @@ def index() -> HTMLResponse:
     return HTMLResponse(index_path.read_text(encoding="utf-8"))
 
 
+@app.post("/api/webhooks/kie")
+@app.get("/api/webhooks/kie")
+def kie_webhook() -> dict:
+    """Kie.ai шлёт callback сюда; результат всё равно читаем polling'ом."""
+    return {"ok": True}
+
+
 @app.get("/api/health")
 def health() -> dict:
     return {

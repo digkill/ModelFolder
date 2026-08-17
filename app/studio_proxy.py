@@ -39,7 +39,7 @@ async def get_http() -> httpx.AsyncClient:
     global _http
     if _http is None or _http.is_closed:
         _http = httpx.AsyncClient(
-            timeout=httpx.Timeout(15.0, connect=2.0),
+            timeout=httpx.Timeout(180.0, connect=2.0),
             follow_redirects=False,
         )
     return _http
@@ -49,8 +49,13 @@ def _forward_headers(request: Request) -> dict[str, str]:
     return {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP}
 
 
-async def _proxy(request: Request, url: str, *, stream_forever: bool = False) -> StreamingResponse:
-    timeout = httpx.Timeout(None if stream_forever else 15.0, connect=2.0)
+async def _proxy(request: Request, url: str, *, stream_forever: bool = False, long_wait: bool = False) -> StreamingResponse:
+    if stream_forever:
+        timeout = httpx.Timeout(None, connect=2.0)
+    elif long_wait:
+        timeout = httpx.Timeout(180.0, connect=2.0)
+    else:
+        timeout = httpx.Timeout(60.0, connect=2.0)
     client = await get_http()
     try:
         body = await request.body()
@@ -60,7 +65,9 @@ async def _proxy(request: Request, url: str, *, stream_forever: bool = False) ->
             headers=_forward_headers(request),
             content=body or None,
         )
-        resp = await client.send(req, stream=True, timeout=timeout)
+        # httpx 0.28+ : timeout задаётся на request, не на send().
+        req.extensions["timeout"] = timeout.as_dict()
+        resp = await client.send(req, stream=True)
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail=f"studio proxy failed: {exc}") from exc
 
@@ -86,10 +93,12 @@ async def studio_api(path: str, request: Request):
     if not STUDIO_API_URL:
         raise HTTPException(status_code=404, detail="Studio API is not enabled")
     qs = f"?{request.url.query}" if request.url.query else ""
+    long_wait = path.rstrip("/").endswith("/chat") or "/chat?" in f"{path}?"
     return await _proxy(
         request,
         f"{STUDIO_API_URL}/api/{path}{qs}",
         stream_forever=path.rstrip("/").endswith("/events"),
+        long_wait=long_wait,
     )
 
 
